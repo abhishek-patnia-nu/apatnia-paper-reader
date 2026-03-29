@@ -1,0 +1,38 @@
+---
+description: AI-assisted paper reading process -- mandatory steps for section-by-section breakdowns
+globs: "**"
+alwaysApply: true
+---
+
+# Paper Reader Rules
+
+Follow GUIDELINES.md in the paper-reader root for full conventions. The non-negotiable rules:
+
+## Pacing
+
+- **One section at a time.** Write a section, then STOP and wait for the user to say they're ready.
+- Never batch-write multiple sections in one turn.
+
+## Knowledge Assessment
+
+- **Before writing the first section** of a new paper, present a structured questionnaire (use AskQuestion) covering all prerequisite concepts. Use three levels: "solid / familiar / new to me".
+- Check the Knowledge Profile in GUIDELINES.md -- skip concepts already mastered from prior papers.
+- Concepts marked "new" get deep background (worked examples, code, diagrams). "Familiar" gets a quick refresher. "Solid" is skipped.
+
+## Section Format
+
+1. "What this section covers" summary
+2. Background sub-sections for new prerequisites
+3. Paper content walkthrough with equation/figure/page references
+4. Key takeaways
+5. Previous/next navigation links
+
+## Figures
+
+- Never reproduce paper charts as ASCII or Mermaid. Reference the figure and ask the user to clip it into `artifacts/`. Embed as `![Figure N](artifacts/figure_N.png)`.
+- DO use Mermaid for new explanatory diagrams (flowcharts, concept maps, architecture overviews).
+
+## Tracking
+
+- Each paper folder has `paper_info.md` with a section status table. Update status to `done` after each section.
+- After completing a paper, update the Knowledge Profile in GUIDELINES.md.

@@ -23,6 +23,13 @@
 3. [How te.autocast and Recipes Wire Into te.Linear](#3-how-teautocast-and-recipes-wire-into-telinear)
 4. [Transformer Engine's NVFP4BlockScaling Recipe](#4-transformer-engines-nvfp4blockscaling-recipe)
 5. [Integration Patterns for NVFP4 Training](#5-integration-patterns-for-nvfp4-training)
+   - 5.1 Minimal: Use Existing Lightning Plugin As-Is
+   - 5.2 Model-Level Mixed Precision via Nested Autocast
+   - 5.3 Mid-Training Precision Switching via Callback
+   - 5.4 Custom Plugin with Dynamic Recipe Selection
+   - 5.5 Selective Layer Replacement (Skip Layers That Stay in BF16)
+   - 5.6 Predicate-Based Linear Layer Filtering
+   - 5.7 Putting It All Together: A Production-Style Recipe
 6. [Distributed Considerations](#6-distributed-considerations)
 7. [Software Requirements and Constraints](#7-software-requirements-and-constraints)
 8. [Open Implementation Questions](#8-open-implementation-questions)
@@ -699,6 +706,626 @@ plugin = NVFP4SelectivePrecision(
 Layers that stay as `nn.Linear` (not `te.Linear`) will be unaffected by
 `te.autocast` — they execute in whatever dtype `torch.autocast` provides
 (the fallback).
+
+### 5.6 Predicate-Based Linear Layer Filtering
+
+§5.5 hard-codes a name-prefix skip list, which is good for "freeze these
+specific blocks in BF16" but awkward for everything else. A more flexible
+pattern uses a **layer predicate** — a callable that decides per-`nn.Linear`
+whether to replace it. Predicates are easy to compose (size + name + block
+index, etc.) and cover the most useful selection patterns with one plugin
+class.
+
+#### 5.6.1 Why You'd Want This
+
+Profiling shows that NVFP4 wall-clock wins on real workloads come from
+GEMM speedup minus TE wrapper overhead. Both scale per-`te.Linear`:
+
+- **Per-call CPU cost** of `te.Linear` is ~3–5x higher than `nn.Linear`
+  (the TE forward pass goes through a custom autograd Function with
+  recipe/scale state management, plus quantize/dequantize plumbing).
+- **Per-kernel GPU speedup** from FP4 grows with the GEMM `M`-dim. Tiny
+  Linears barely benefit because their kernel is already dominated by
+  launch overhead, not arithmetic.
+
+Net: wrapping a 1024×128 projection in `te.Linear` costs more dispatch
+than it saves on the GEMM. Wrapping a 1024×3072 FFN expansion saves
+substantial wall-clock. A predicate lets you keep the big wins and drop
+the small losses.
+
+In hybrid GDN/Mamba/transformer models the picture sharpens further: the
+GDN gating projections (`a_proj`, `b_proj`) often have `out_features=12`
+or similar small values that don't even satisfy TE's
+divisible-by-16 dimension constraint; they get skipped automatically.
+But the `q_proj`/`k_proj`/`v_proj` projections inside GDN blocks are
+typically smaller than the FFN GEMMs and may not pay back the wrapper
+cost — those are the ones a predicate can target.
+
+#### 5.6.2 Plugin with Predicate Support
+
+```python
+from typing import Callable
+
+import torch
+from lightning.fabric.plugins.precision.transformer_engine import (
+    TransformerEnginePrecision as FabricTEPrecision,
+)
+from lightning.pytorch.plugins.precision.precision import Precision
+
+
+# A predicate decides whether a given Linear should be REPLACED with te.Linear.
+# Returning True → replace (low precision). False → leave as nn.Linear (BF16).
+LinearPredicate = Callable[[str, torch.nn.Linear], bool]
+
+
+class NVFP4FilteredPrecision(Precision, FabricTEPrecision):
+    """NVFP4 plugin with predicate-based per-Linear replacement.
+
+    ``replacement_filter`` is called for every ``nn.Linear`` in the model.
+    It receives the dotted module name and the layer; return True to
+    convert to ``te.Linear``, False to leave alone. ``None`` → replace all
+    (matching the default ``TransformerEnginePrecision`` behavior).
+    """
+
+    precision = "nvfp4-filtered"
+
+    def __init__(
+        self,
+        *,
+        weights_dtype: torch.dtype,
+        recipe,
+        replacement_filter: LinearPredicate | None = None,
+    ):
+        super().__init__(weights_dtype=weights_dtype, recipe=recipe)
+        self.replacement_filter = replacement_filter
+
+    def convert_module(self, module: torch.nn.Module) -> torch.nn.Module:
+        import transformer_engine.pytorch as te
+
+        # Snapshot names first since we'll mutate the tree as we iterate.
+        candidates = [
+            (n, m) for n, m in module.named_modules() if isinstance(m, torch.nn.Linear)
+        ]
+        for name, child in candidates:
+            if (
+                self.replacement_filter is not None
+                and not self.replacement_filter(name, child)
+            ):
+                continue
+            # Same shape constraints as TE's internal _convert_layers.
+            if child.in_features % 16 != 0 or child.out_features % 16 != 0:
+                continue
+
+            parent_name, _, attr = name.rpartition(".")
+            parent = module.get_submodule(parent_name) if parent_name else module
+            has_bias = child.bias is not None
+            replacement = te.Linear(
+                child.in_features, child.out_features, bias=has_bias
+            )
+            replacement.weight.data = child.weight.data.clone()
+            if has_bias:
+                replacement.bias.data = child.bias.data.clone()
+            setattr(parent, attr, replacement)
+
+        module = module.to(dtype=self.weights_dtype)
+        return module
+```
+
+The plugin reuses `forward_context()` from the base class, so `te.autocast`
+behavior is unchanged — we only narrow which Linears go through the
+recipe's quantization path.
+
+#### 5.6.3 Predicate Building Blocks
+
+Small, single-purpose predicates that compose well:
+
+```python
+def by_min_size(min_params: int) -> LinearPredicate:
+    """Keep NVFP4 only on Linears with at least ``min_params`` parameters."""
+    def pred(name: str, layer: torch.nn.Linear) -> bool:
+        return layer.in_features * layer.out_features >= min_params
+    return pred
+
+
+def by_name_pattern(*substrings: str) -> LinearPredicate:
+    """Keep NVFP4 on Linears whose dotted name contains any substring."""
+    def pred(name: str, layer: torch.nn.Linear) -> bool:
+        return any(s in name for s in substrings)
+    return pred
+
+
+def not_by_name_pattern(*substrings: str) -> LinearPredicate:
+    """Skip Linears whose name contains any of these substrings."""
+    def pred(name: str, layer: torch.nn.Linear) -> bool:
+        return not any(s in name for s in substrings)
+    return pred
+
+
+def by_block_index(
+    max_block_idx: int,
+    block_segment: str = "blocks",
+) -> LinearPredicate:
+    """Keep NVFP4 on Linears in transformer blocks 0..max_block_idx-1.
+
+    Looks for a path segment matching ``block_segment`` followed by an
+    integer index. Layers that aren't inside a numbered block (embeddings,
+    final norm, lm_head) return True by default — compose with another
+    predicate if you want different behavior for them.
+    """
+    def pred(name: str, layer: torch.nn.Linear) -> bool:
+        parts = name.split(".")
+        for i, part in enumerate(parts[:-1]):
+            if part == block_segment:
+                try:
+                    return int(parts[i + 1]) < max_block_idx
+                except ValueError:
+                    return True
+        return True
+    return pred
+
+
+def all_of(*predicates: LinearPredicate) -> LinearPredicate:
+    def pred(name: str, layer: torch.nn.Linear) -> bool:
+        return all(p(name, layer) for p in predicates)
+    return pred
+
+
+def any_of(*predicates: LinearPredicate) -> LinearPredicate:
+    def pred(name: str, layer: torch.nn.Linear) -> bool:
+        return any(p(name, layer) for p in predicates)
+    return pred
+```
+
+#### 5.6.4 Useful Filter Recipes
+
+**Recipe A — "FFN-only" NVFP4.** Many models have FFN GEMMs that are 3–4x
+bigger than attention projections (e.g., hidden=1024 → ffn=3072). FFN
+Linears typically dominate FLOPs; quantizing only those keeps most of
+the GPU savings while halving the TE wrapper count.
+
+```python
+plugin = NVFP4FilteredPrecision(
+    weights_dtype=torch.bfloat16,
+    recipe=NVFP4BlockScaling(),
+    # FFN linears in many models are named w1/w2/w3 (SwiGLU),
+    # gate_proj/up_proj/down_proj (Llama style), or fc1/fc2 (GPT style).
+    replacement_filter=by_name_pattern(
+        "w1", "w2", "w3",
+        "gate_proj", "up_proj", "down_proj",
+        "fc1", "fc2",
+    ),
+)
+```
+
+**Recipe B — "Skip small projections in hybrid models."** GDN-hybrid
+models have many small projections per block (q/k/v/g/o, plus dt-bias
+projections). Skipping the ones below an empirical size threshold keeps
+the FFN expansion + softmax-attention QKV in NVFP4 and lets the small
+projections stay in BF16:
+
+```python
+plugin = NVFP4FilteredPrecision(
+    weights_dtype=torch.bfloat16,
+    recipe=NVFP4BlockScaling(),
+    replacement_filter=by_min_size(min_params=512 * 1024),  # ~0.5M params
+)
+```
+
+**Recipe C — "Last 15% in higher precision" (paper pattern).** The NVFP4
+paper recommends keeping the final ~15% of transformer blocks in higher
+precision. The plugin replaces only the early blocks; later blocks stay
+as `nn.Linear` and run in the BF16 fallback set by `forward_context()`.
+For an MXFP8 tail (instead of BF16) compose with the model-level nested
+autocast pattern from §5.2.
+
+```python
+n_blocks = 28
+high_prec_start = int(n_blocks * 0.85)  # 24
+
+plugin = NVFP4FilteredPrecision(
+    weights_dtype=torch.bfloat16,
+    recipe=NVFP4BlockScaling(),
+    replacement_filter=all_of(
+        by_block_index(max_block_idx=high_prec_start, block_segment="blocks"),
+        # Also keep lm_head out of NVFP4 even though it's shape-eligible.
+        not_by_name_pattern("lm_head"),
+    ),
+)
+```
+
+**Recipe D — "Skip GDN gating + lm_head + sub-threshold."** Combines
+several heuristics to maximize NVFP4 coverage on payoff-positive
+Linears only:
+
+```python
+plugin = NVFP4FilteredPrecision(
+    weights_dtype=torch.bfloat16,
+    recipe=NVFP4BlockScaling(),
+    replacement_filter=all_of(
+        # Skip the small dt-bias / gating projections inside GDN blocks
+        # that don't satisfy NVFP4's divisible-by-16 anyway. Listing them
+        # by name here means TE doesn't have to log a warning for each.
+        not_by_name_pattern("a_proj", "b_proj"),
+        not_by_name_pattern("lm_head"),
+        by_min_size(min_params=256 * 1024),
+    ),
+)
+```
+
+#### 5.6.5 Audit Helper: Preview Before Training
+
+Predicate bugs are silent — a typo can leave 90% of the model in BF16 and
+you won't notice until you compare against an unfiltered baseline. Always
+audit the filter against the actual model before training:
+
+```python
+import json
+from collections import Counter
+
+def audit_replacements(
+    model: torch.nn.Module,
+    plugin: NVFP4FilteredPrecision,
+) -> dict:
+    """Return what ``plugin.convert_module`` would do, without mutating ``model``.
+
+    Mirrors the plugin's decision tree (predicate first, then shape
+    constraints) so the audit is consistent with what training will see.
+    """
+    replaced, skipped = [], []
+    for name, child in model.named_modules():
+        if not isinstance(child, torch.nn.Linear):
+            continue
+        params = child.in_features * child.out_features
+        entry = {
+            "name": name,
+            "shape": [child.in_features, child.out_features],
+            "params": params,
+        }
+        if (
+            plugin.replacement_filter is not None
+            and not plugin.replacement_filter(name, child)
+        ):
+            entry["reason"] = "predicate rejected"
+            skipped.append(entry)
+        elif child.in_features % 16 or child.out_features % 16:
+            entry["reason"] = (
+                f"dim not divisible by 16 "
+                f"(in%16={child.in_features % 16}, out%16={child.out_features % 16})"
+            )
+            skipped.append(entry)
+        else:
+            replaced.append(entry)
+
+    leaf_name = lambda e: e["name"].rsplit(".", 1)[-1]
+    return {
+        "summary": {
+            "replaced_count": len(replaced),
+            "skipped_count": len(skipped),
+            "replaced_params": sum(e["params"] for e in replaced),
+            "skipped_params": sum(e["params"] for e in skipped),
+            "replaced_param_fraction": (
+                sum(e["params"] for e in replaced)
+                / max(1, sum(e["params"] for e in replaced + skipped))
+            ),
+            "replaced_by_leaf_name": Counter(leaf_name(e) for e in replaced),
+            "skipped_by_leaf_name": Counter(leaf_name(e) for e in skipped),
+        },
+        "replaced": replaced,
+        "skipped": skipped,
+    }
+```
+
+Use it as a sanity check before kicking off `trainer.fit`:
+
+```python
+diag = audit_replacements(model, plugin)
+print(json.dumps(diag["summary"], indent=2, default=dict))
+# {
+#   "replaced_count": 196,
+#   "skipped_count": 64,
+#   "replaced_params": 432000000,
+#   "skipped_params": 18000000,
+#   "replaced_param_fraction": 0.96,
+#   "replaced_by_leaf_name": {"w1": 28, "w2": 28, "w3": 28, ...},
+#   "skipped_by_leaf_name":  {"q_proj": 21, "a_proj": 21, "lm_head": 1, ...}
+# }
+```
+
+If `replaced_param_fraction` is, say, < 0.7, most of the model's weight
+is still in BF16 and you'll see a much smaller speedup than the per-kernel
+FP4 advantage suggests. Use that fraction (and the per-leaf-name
+breakdown) to tune the predicate before paying for a full training run.
+
+#### 5.6.6 Pairing With Profiling
+
+The audit tells you *which* layers will be replaced. Profiling tells you
+*which replacements paid off*. The right loop:
+
+1. Pick a predicate. Audit. Confirm fraction looks right.
+2. Train for ~200 steps at production seq/batch with profiler enabled
+   (with `record_module_names=False` — see §6 for why this matters for
+   `torch.compile`).
+3. Compute tokens/sec for the filtered run vs an unfiltered NVFP4 run vs
+   BF16.
+4. If filtered NVFP4 ≥ unfiltered NVFP4 in tokens/sec, the predicate is
+   net positive — the dispatch overhead saved exceeds the GEMM speedup
+   given up. Otherwise tighten or relax the filter and repeat.
+
+The convergence side (loss curves) is a separate question — predicates
+that exclude too many layers may also degrade gradient quality. Always
+pair throughput audits with a short loss-quality check on a small
+training run.
+
+### 5.7 Putting It All Together: A Production-Style Recipe
+
+§5.1–5.6 each cover one knob. A faithful implementation of the paper's
+headline training recipe needs all of them at once. This section combines
+them into a single plugin + callback + model pattern.
+
+#### 5.7.1 The Three Orthogonal Choices
+
+Adopting NVFP4 in a real training stack involves three independent
+decisions. Each maps to a different mechanism in the Lightning + TE
+stack:
+
+| Decision                                               | Mechanism                              | Section |
+|--------------------------------------------------------|----------------------------------------|---------|
+| Which Linears become `te.Linear` at all                | Plugin's `convert_module` + predicate  | §5.6    |
+| What precision each `te.Linear` runs in *per step*     | Plugin's `forward_context` recipe      | §5.1    |
+| How the recipe changes *over training*                 | Step-aware `active_recipe`             | §5.4    |
+| Per-layer recipe override (e.g., MXFP8 tail blocks)    | Nested `te.autocast` in model.forward  | §5.2    |
+| Sanity-check coverage before paying for a long run     | `audit_replacements()`                 | §5.6.5  |
+
+The combined plugin below handles the first three; the fourth is opt-in
+model code; the fifth is a pre-flight check.
+
+#### 5.7.2 The Combined Plugin
+
+```python
+from contextlib import ExitStack
+from typing import Callable
+
+import torch
+from lightning.fabric.plugins.precision.transformer_engine import (
+    TransformerEnginePrecision as FabricTEPrecision,
+)
+from lightning.fabric.plugins.precision.utils import _DtypeContextManager
+from lightning.pytorch.plugins.precision.precision import Precision
+
+
+LinearPredicate = Callable[[str, torch.nn.Linear], bool]
+
+
+class NVFP4ProductionPrecision(Precision, FabricTEPrecision):
+    """Filter + dynamic-recipe NVFP4 plugin.
+
+    - ``replacement_filter`` chooses which ``nn.Linear`` modules get
+      converted to ``te.Linear`` (§5.6).
+    - ``nvfp4_recipe`` is used while ``current_step < switch_step``.
+    - ``decay_recipe`` is used once ``current_step >= switch_step``
+      (§5.3, §5.4).
+    - The current step is pushed in by ``StepTracker`` (§5.7.3) so the
+      plugin doesn't need to inspect the trainer.
+    """
+
+    precision = "nvfp4-production"
+
+    def __init__(
+        self,
+        *,
+        weights_dtype: torch.dtype = torch.bfloat16,
+        nvfp4_recipe=None,
+        decay_recipe=None,
+        switch_step: int | None = None,
+        replacement_filter: LinearPredicate | None = None,
+    ):
+        from transformer_engine.common.recipe import (
+            NVFP4BlockScaling,
+            MXFP8BlockScaling,
+        )
+        super().__init__(
+            weights_dtype=weights_dtype,
+            recipe=nvfp4_recipe or NVFP4BlockScaling(),
+        )
+        self.decay_recipe = decay_recipe or MXFP8BlockScaling()
+        self.switch_step = switch_step
+        self.replacement_filter = replacement_filter
+        self._current_step = 0
+
+    # --- step tracking (called from a callback) ---
+    def on_step(self, step: int) -> None:
+        self._current_step = step
+
+    @property
+    def active_recipe(self):
+        if self.switch_step is not None and self._current_step >= self.switch_step:
+            return self.decay_recipe
+        return self.recipe
+
+    # --- forward_context: NVFP4 → MXFP8 swap based on step ---
+    def forward_context(self):
+        import transformer_engine.pytorch as te
+
+        stack = ExitStack()
+        stack.enter_context(_DtypeContextManager(self.weights_dtype))
+        stack.enter_context(
+            torch.autocast(device_type="cuda", dtype=self.fallback_compute_dtype)
+        )
+        stack.enter_context(
+            te.fp8_autocast(enabled=True, fp8_recipe=self.active_recipe)
+        )
+        return stack
+
+    # --- convert_module: predicate-based replacement ---
+    def convert_module(self, module: torch.nn.Module) -> torch.nn.Module:
+        import transformer_engine.pytorch as te
+
+        candidates = [
+            (n, m) for n, m in module.named_modules() if isinstance(m, torch.nn.Linear)
+        ]
+        for name, child in candidates:
+            if (
+                self.replacement_filter is not None
+                and not self.replacement_filter(name, child)
+            ):
+                continue
+            if child.in_features % 16 != 0 or child.out_features % 16 != 0:
+                continue
+            parent_name, _, attr = name.rpartition(".")
+            parent = module.get_submodule(parent_name) if parent_name else module
+            has_bias = child.bias is not None
+            replacement = te.Linear(
+                child.in_features, child.out_features, bias=has_bias
+            )
+            replacement.weight.data = child.weight.data.clone()
+            if has_bias:
+                replacement.bias.data = child.bias.data.clone()
+            setattr(parent, attr, replacement)
+
+        module = module.to(dtype=self.weights_dtype)
+        return module
+```
+
+The class is mostly composition: `convert_module` is §5.6's predicate
+filter, `forward_context` is §5.4's dynamic recipe selector. The two
+features are independent — set `replacement_filter=None` for full
+coverage, or `switch_step=None` for a static recipe.
+
+#### 5.7.3 Step-Tracking Callback
+
+The plugin doesn't depend on the trainer; a callback feeds the current
+step in once per batch:
+
+```python
+import lightning.pytorch as L
+
+class StepTracker(L.Callback):
+    """Push ``trainer.global_step`` into a step-aware precision plugin."""
+
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        plugin = trainer.precision_plugin
+        if hasattr(plugin, "on_step"):
+            plugin.on_step(trainer.global_step)
+```
+
+This keeps `trainer.precision_plugin` decoupled from Lightning's
+internals — easier to unit-test, and the same plugin works under Fabric
+without changes.
+
+#### 5.7.4 Optional: Model-Side Nested Autocast for an MXFP8 Tail
+
+The plugin alone leaves the last `(1 - 0.85) * n_blocks` blocks running
+in *whatever the predicate excludes them into*. If you skip them via
+`by_block_index` (§5.6.4 Recipe C), they stay as `nn.Linear` → BF16
+fallback. To run them in MXFP8 instead (closer to the paper), let the
+plugin convert them to `te.Linear` and override the recipe locally in
+the model's forward (the §5.2 pattern):
+
+```python
+import transformer_engine.pytorch as te
+from transformer_engine.common.recipe import MXFP8BlockScaling
+
+class MyModel(L.LightningModule):
+    HIGH_PREC_START = 24      # last 4 of 28 blocks → MXFP8
+    HIGH_PREC_RECIPE = MXFP8BlockScaling()
+
+    def forward(self, x):
+        for i, block in enumerate(self.blocks):
+            if i >= self.HIGH_PREC_START:
+                # Inner autocast wins over the plugin's outer one (§3.4).
+                with te.autocast(recipe=self.HIGH_PREC_RECIPE):
+                    x = block(x)
+            else:
+                x = block(x)
+        return x
+```
+
+The inner `te.autocast` overrides whatever recipe the plugin's
+`forward_context()` set for the outer scope, so the tail blocks run in
+MXFP8 while the bulk runs in NVFP4 (or MXFP8 after the mid-training
+switch — the plugin's behavior is unchanged).
+
+#### 5.7.5 Pre-Flight Audit + Trainer Wiring
+
+```python
+import json
+import torch
+from lightning.pytorch import Trainer
+from transformer_engine.common.recipe import NVFP4BlockScaling, MXFP8BlockScaling
+
+# --- Filter: skip lm_head, very small projections, and the last 15% of blocks ---
+n_blocks = 28
+high_prec_start = int(n_blocks * 0.85)  # 24
+
+replacement_filter = all_of(
+    by_block_index(max_block_idx=high_prec_start, block_segment="blocks"),
+    not_by_name_pattern("lm_head"),
+    by_min_size(min_params=256 * 1024),
+)
+
+# --- Plugin: NVFP4 for ~85% of training, MXFP8 thereafter ---
+total_steps = 100_000
+plugin = NVFP4ProductionPrecision(
+    weights_dtype=torch.bfloat16,
+    nvfp4_recipe=NVFP4BlockScaling(),
+    decay_recipe=MXFP8BlockScaling(),
+    switch_step=int(total_steps * 0.85),     # 85_000
+    replacement_filter=replacement_filter,
+)
+
+# --- Audit: catch filter bugs before paying for the run ---
+model = MyModel(...)
+diag = audit_replacements(model, plugin)
+print(json.dumps(diag["summary"], indent=2, default=dict))
+assert diag["summary"]["replaced_param_fraction"] >= 0.70, (
+    f"filter too aggressive: only {diag['summary']['replaced_param_fraction']:.0%} "
+    f"of params will run in NVFP4"
+)
+
+# --- Wire it up ---
+trainer = Trainer(
+    plugins=[plugin],
+    callbacks=[StepTracker(), ...],
+    max_steps=total_steps,
+    accelerator="gpu",
+    devices=8,
+)
+trainer.fit(model, datamodule)
+```
+
+#### 5.7.6 Mapping Back to the Paper
+
+| Paper element                                       | Where it lives in this recipe                                |
+|-----------------------------------------------------|--------------------------------------------------------------|
+| NVFP4 GEMMs in most layers                          | `nvfp4_recipe` + plugin's `convert_module`                   |
+| Stochastic rounding, RHT, 2D weight scaling         | `NVFP4BlockScaling()` defaults (§4.1)                        |
+| Last ~15% of blocks in higher precision             | `by_block_index` filter (BF16 tail) **or** §5.7.4 (MXFP8 tail)|
+| `lm_head` excluded from FP4                         | `not_by_name_pattern("lm_head")` filter                      |
+| NVFP4 → MXFP8 mid-training switch                   | `switch_step` + `decay_recipe` + `StepTracker`               |
+| TP/SP all-reduce of amax                            | Automatic in `te.Linear` (see §6)                            |
+| FSDP-friendly                                       | TE quantizes post-gather; nothing to do (see §6.3)           |
+| Skip layers below the FP4 payback threshold         | `by_min_size` filter (empirical threshold)                   |
+| Verify coverage before training                     | `audit_replacements()` pre-flight                            |
+
+#### 5.7.7 Knobs to Tune
+
+Each filter parameter and step boundary is empirical. Reasonable starting
+points and what to watch:
+
+- **`high_prec_start = int(n_blocks * 0.85)`** — paper recommends 15%.
+  Watch downstream eval; if loss diverges from BF16 reference late in
+  training, increase the high-precision tail.
+- **`switch_step = 0.85 * total_steps`** — anchored to the LR decay
+  start. Too early loses the FP4 throughput win; too late lets the
+  quantization noise compound through decay.
+- **`min_params = 256 * 1024`** — purely throughput-driven. Sweep
+  thresholds (`128 * 1024`, `512 * 1024`, `1024 * 1024`) and pick the
+  one with the best `tokens/sec` from the §5.6.6 profile loop. Has no
+  effect on convergence (the skipped layers run in BF16 fallback, same
+  as they would without TE).
+- **`replaced_param_fraction` floor** — the assert in §5.7.5 catches
+  filter regressions. 70% is a soft floor; under that you've effectively
+  trained a BF16 model with extra TE overhead.
 
 ---
 

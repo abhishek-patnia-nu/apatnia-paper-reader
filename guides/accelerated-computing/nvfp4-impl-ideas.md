@@ -30,6 +30,7 @@
    - 5.5 Selective Layer Replacement (Skip Layers That Stay in BF16)
    - 5.6 Predicate-Based Linear Layer Filtering
    - 5.7 Putting It All Together: A Production-Style Recipe
+   - 5.8 How NVFP4 Paper-Mode Differs from `bf16-mixed`
 6. [Distributed Considerations](#6-distributed-considerations)
 7. [Software Requirements and Constraints](#7-software-requirements-and-constraints)
 8. [Open Implementation Questions](#8-open-implementation-questions)
@@ -1099,6 +1100,14 @@ LinearPredicate = Callable[[str, torch.nn.Linear], bool]
 class NVFP4ProductionPrecision(Precision, FabricTEPrecision):
     """Filter + dynamic-recipe NVFP4 plugin.
 
+    - ``weights_dtype`` is the on-device parameter dtype. Use ``float32``
+      for FP32 master weights (paper-faithful, what the optimizer sees);
+      use ``bfloat16`` for BF16-throughout (smaller, less stable).
+    - ``fallback_compute_dtype`` is the autocast dtype for Linears that
+      ``replacement_filter`` skips (and any non-TE op). Pass
+      ``torch.bfloat16`` explicitly when ``weights_dtype=torch.float32``,
+      otherwise the parent class defaults it to ``weights_dtype`` and the
+      skipped Linears silently run in FP32 (see §5.8.8).
     - ``replacement_filter`` chooses which ``nn.Linear`` modules get
       converted to ``te.Linear`` (§5.6).
     - ``nvfp4_recipe`` is used while ``current_step < switch_step``.
@@ -1114,6 +1123,7 @@ class NVFP4ProductionPrecision(Precision, FabricTEPrecision):
         self,
         *,
         weights_dtype: torch.dtype = torch.bfloat16,
+        fallback_compute_dtype: torch.dtype | None = None,
         nvfp4_recipe=None,
         decay_recipe=None,
         switch_step: int | None = None,
@@ -1126,6 +1136,7 @@ class NVFP4ProductionPrecision(Precision, FabricTEPrecision):
         super().__init__(
             weights_dtype=weights_dtype,
             recipe=nvfp4_recipe or NVFP4BlockScaling(),
+            fallback_compute_dtype=fallback_compute_dtype,
         )
         self.decay_recipe = decay_recipe or MXFP8BlockScaling()
         self.switch_step = switch_step
@@ -1266,7 +1277,14 @@ replacement_filter = all_of(
 # --- Plugin: NVFP4 for ~85% of training, MXFP8 thereafter ---
 total_steps = 100_000
 plugin = NVFP4ProductionPrecision(
-    weights_dtype=torch.bfloat16,
+    # FP32 master weights → optimizer keeps FP32 m/v + FP32 params.
+    # TE quantizes FP32 → FP4 at GEMM time. ``weights_dtype=bf16`` would
+    # break the master-weights property and store BF16 optimizer state.
+    weights_dtype=torch.float32,
+    # Skipped Linears (tail blocks, lm_head) run in BF16 via autocast.
+    # Without this, ``fallback_compute_dtype`` defaults to ``weights_dtype``
+    # and the skipped Linears would run in FP32 (see §5.8.8).
+    fallback_compute_dtype=torch.bfloat16,
     nvfp4_recipe=NVFP4BlockScaling(),
     decay_recipe=MXFP8BlockScaling(),
     switch_step=int(total_steps * 0.85),     # 85_000
@@ -1297,6 +1315,8 @@ trainer.fit(model, datamodule)
 
 | Paper element                                       | Where it lives in this recipe                                |
 |-----------------------------------------------------|--------------------------------------------------------------|
+| FP32 master weights, FP32 optimizer state           | `weights_dtype=torch.float32` (see §5.8 for what this means) |
+| BF16 fallback for skipped Linears                   | `fallback_compute_dtype=torch.bfloat16` (§5.8.8 gotcha)      |
 | NVFP4 GEMMs in most layers                          | `nvfp4_recipe` + plugin's `convert_module`                   |
 | Stochastic rounding, RHT, 2D weight scaling         | `NVFP4BlockScaling()` defaults (§4.1)                        |
 | Last ~15% of blocks in higher precision             | `by_block_index` filter (BF16 tail) **or** §5.7.4 (MXFP8 tail)|
@@ -1312,6 +1332,14 @@ trainer.fit(model, datamodule)
 Each filter parameter and step boundary is empirical. Reasonable starting
 points and what to watch:
 
+- **`weights_dtype`** — `torch.float32` for paper-faithful FP32 master
+  weights (the optimizer keeps FP32 `m`, `v`, params); `torch.bfloat16`
+  for BF16-throughout if you're willing to trade stability for memory.
+  Cost of FP32: 2× param storage and 2× optimizer state vs BF16. See
+  §5.8 for the full lifecycle implications.
+- **`fallback_compute_dtype`** — set explicitly to `torch.bfloat16`
+  whenever `weights_dtype` is `torch.float32`. Otherwise it defaults to
+  `weights_dtype` and skipped Linears silently run in FP32 (§5.8.8).
 - **`high_prec_start = int(n_blocks * 0.85)`** — paper recommends 15%.
   Watch downstream eval; if loss diverges from BF16 reference late in
   training, increase the high-precision tail.
@@ -1326,6 +1354,175 @@ points and what to watch:
 - **`replaced_param_fraction` floor** — the assert in §5.7.5 catches
   filter regressions. 70% is a soft floor; under that you've effectively
   trained a BF16 model with extra TE overhead.
+
+### 5.8 How NVFP4 Paper-Mode Differs from `bf16-mixed`
+
+The §5.7 plugin is most useful when you can articulate exactly *what
+changes* between a `bf16-mixed` baseline and a paper-faithful NVFP4 run.
+With the right config (`weights_dtype=torch.float32`,
+`fallback_compute_dtype=torch.bfloat16`) the optimizer-side semantics
+are identical; the differences are concentrated in `convert_module`,
+the `forward_context` stack, and what gets saved for backward. Walking
+through each lifecycle stage clarifies which knob is doing what.
+
+#### 5.8.1 Module Construction
+
+| | `bf16-mixed` (Lightning's `MixedPrecision`) | NVFP4 paper-mode (`NVFP4ProductionPrecision`) |
+|---|---|---|
+| `convert_module` | no-op — `MixedPrecision` doesn't override it | walks the tree, swaps eligible `nn.Linear` → `te.Linear` for the bulk of blocks, then `module.to(weights_dtype)` casts every parameter |
+| Param dtype on device | FP32 (whatever the model was built with) | FP32 (when `weights_dtype=torch.float32`) |
+| Module class for transformer Linears | `nn.Linear` everywhere | `te.Linear` for the early blocks, `nn.Linear` for the high-precision tail + `lm_head` |
+
+#### 5.8.2 forward_context (wraps every train step)
+
+```python
+# bf16-mixed
+torch.autocast("cuda", dtype=torch.bfloat16)
+
+# NVFP4 paper-mode
+ExitStack:
+    _DtypeContextManager(weights_dtype)                       # default tensor dtype
+    torch.autocast("cuda", dtype=fallback_compute_dtype)      # fallback for skipped layers
+    te.fp8_autocast(enabled=True, fp8_recipe=active_recipe)   # NVFP4 or MXFP8
+```
+
+#### 5.8.3 At a Linear's Forward Call
+
+| Stage | `bf16-mixed`, `nn.Linear` (FP32 weight) | NVFP4, `te.Linear` (FP32 weight) — eligible block | NVFP4, `nn.Linear` (FP32 weight) — skipped tail / `lm_head` |
+|---|---|---|---|
+| Input | activations from previous op | activations | activations |
+| Cast at op boundary | `x.to(bf16)`, `w.to(bf16)` (autocast) | TE quantizes `x` (1×16 NVFP4) and `w` (16×16 NVFP4 with RHT) | depends on `fallback_compute_dtype` |
+| GEMM dtype | **BF16 × BF16 → BF16** on Tensor Cores | **FP4 × FP4 → BF16** on Tensor Cores (E4M3 block scales applied per block, FP32 global scale post-GEMM) | matches fallback dtype |
+| Saved-for-backward | BF16 `x` and `w` views (16 bits/elt) | FP4 rowwise + columnwise copies + E4M3 scales (~4.5 bits/elt) | matches fallback dtype |
+
+Two asymmetries worth highlighting:
+
+- **Where precision loss happens.** `bf16-mixed`'s precision drop is a
+  boundary cast (FP32 → BF16, near-trivial in practice — BF16 has the
+  same 8-bit exponent as FP32). NVFP4 applies an RHT to the weight,
+  then 16×16 block-amax scaling, then 4-bit quantization with
+  stochastic rounding on the gradient path. The numerics machinery is
+  doing real work for outlier suppression — that's where the paper's
+  three features (RHT, 2D block scaling, stochastic rounding) live.
+- **What backward saves.** `bf16-mixed` saves BF16 activations
+  (16 bits/elt). NVFP4 saves FP4 activations (~4.5 bits/elt). Activation
+  memory drops by ~3.5×, which is where most of the FP4 batch-size
+  headroom comes from on long-sequence training.
+
+#### 5.8.4 Backward
+
+| | `bf16-mixed` | NVFP4 paper-mode |
+|---|---|---|
+| Backward inside autocast? | No (Lightning exits before `loss.backward()`) | No (same), but TE's saved tensors carry the recipe info |
+| dgrad GEMM (`grad_out × wᵀ`) | BF16 GEMM | FP4 GEMM using saved FP4 columnwise weight, with stochastic rounding when re-quantizing `grad_out` |
+| wgrad GEMM (`xᵀ × grad_out`) | BF16 GEMM | FP4 GEMM using saved FP4 columnwise activation, with RHT applied to inputs before quantization |
+| Where `param.grad` lands | FP32 — autograd accumulates BF16 grad onto FP32 `nn.Parameter.grad` (boundary cast) | FP32 — same boundary cast, even though the GEMM was FP4 |
+
+In both setups the gradient *the optimizer sees* is FP32. The difference
+is purely in *how* that FP32 gradient was computed (BF16 GEMM vs FP4
+GEMM with stochastic rounding).
+
+#### 5.8.5 Optimizer Step
+
+| | `bf16-mixed` | NVFP4 paper-mode |
+|---|---|---|
+| Param dtype | FP32 | FP32 |
+| Grad dtype | FP32 | FP32 |
+| AdamW `m`, `v` state | FP32 | FP32 |
+| GradScaler | None (BF16 has FP32-equivalent dynamic range) | None |
+
+Optimizer-side they're identical — both have FP32 master weights with
+FP32 optimizer state. `weights_dtype=torch.float32` on the NVFP4 plugin
+is what makes this true; `weights_dtype=torch.bfloat16` would store BF16
+params and BF16 optimizer state, breaking the master-weights property.
+
+#### 5.8.6 Memory per Parameter
+
+For one logical parameter, ignoring activations:
+
+| Bucket | `bf16-mixed` | NVFP4 paper-mode |
+|---|---|---|
+| Weight on `Module` | 4 B (FP32) | 4 B (FP32) |
+| `param.grad` | 4 B (FP32) | 4 B (FP32) |
+| AdamW `m` | 4 B (FP32) | 4 B (FP32) |
+| AdamW `v` | 4 B (FP32) | 4 B (FP32) |
+| **Subtotal: optimizer-related** | **16 B/param** | **16 B/param** |
+| TE FP4 row+col cache (forward only, freed after backward) | — | ~1 B/param + small scale tables |
+| Saved activations (per step, dominates at long seqlen) | BF16 ⇒ 2 B / stored value | FP4 ⇒ ~0.6 B / stored value |
+
+Parameters and optimizer state cost the same. The savings come almost
+entirely from saved activations, which is why FP4's batch-size headroom
+shows up most when `seqlen × hidden` is big (the FFN intermediates).
+
+#### 5.8.7 Behavior Over Training Time
+
+- **`bf16-mixed`:** static. Same plugin behavior at step 0 and step
+  100k.
+- **NVFP4 paper-mode:** `te.fp8_autocast` reads `self.active_recipe`
+  fresh each step (a `StepTracker` callback pushes `global_step` into
+  the plugin). At `switch_step`, the property flips from
+  `NVFP4BlockScaling` to `MXFP8BlockScaling` and the next forward and
+  backward run in MXFP8. Stored params and optimizer state aren't
+  touched — only the *quantization recipe applied at GEMM time*.
+
+#### 5.8.8 The `fallback_compute_dtype` Gotcha
+
+`TransformerEnginePrecision`'s parent has a subtle default:
+
+```python
+# In the parent's __init__:
+self.fallback_compute_dtype = fallback_compute_dtype or weights_dtype
+```
+
+If you set `weights_dtype=torch.float32` (for FP32 master weights) and
+**don't** override `fallback_compute_dtype`, the outer
+`torch.autocast("cuda", dtype=fp32)` becomes a no-op. The skipped
+Linears (high-precision tail blocks, `lm_head`) then run in **FP32, not
+BF16** — slower than the `bf16-mixed` baseline for those layers, and
+farther from the paper than necessary.
+
+Pass `fallback_compute_dtype=torch.bfloat16` explicitly:
+
+```python
+plugin = NVFP4ProductionPrecision(
+    weights_dtype=torch.float32,
+    fallback_compute_dtype=torch.bfloat16,   # tail blocks + lm_head run in BF16
+    nvfp4_recipe=NVFP4BlockScaling(),
+    decay_recipe=MXFP8BlockScaling(),
+    switch_step=int(0.85 * total_steps),
+    replacement_filter=replacement_filter,
+)
+```
+
+With this, the tail blocks behave **identically to `bf16-mixed`** (FP32
+weights, BF16 GEMM via autocast), while the bulk runs in NVFP4 with
+FP32 master weights. The only thing that differs between the two runs
+is the GEMM precision in the inner ~85% of blocks — which is the
+comparison the paper's throughput numbers are actually claimed against.
+
+#### 5.8.9 What This Means for Benchmarking
+
+If you want a meaningful tokens/sec or loss comparison between
+`bf16-mixed` and NVFP4:
+
+1. **Keep `weights_dtype=torch.float32` on the NVFP4 plugin.** Otherwise
+   you're measuring FP4-GEMM-vs-BF16-GEMM **and** BF16-master-vs-FP32-
+   master in one mixed signal.
+2. **Pass `fallback_compute_dtype=torch.bfloat16`.** Otherwise the
+   skipped Linears have a different compute dtype than the baseline,
+   confounding the per-block comparison.
+3. **Match the optimizer config.** Both runs should use the same
+   AdamW settings, same gradient clipping, same LR schedule. With (1)
+   and (2) above, the optimizer state is byte-for-byte the same.
+4. **Match the seq/batch geometry.** The activation-memory savings let
+   NVFP4 fit larger batch — so report tokens/sec, not ms/step, when
+   batch size differs.
+
+What you're left measuring is the throughput delta from FP4 GEMMs in
+the early ~85% of the model, plus or minus the per-`te.Linear` wrapper
+overhead, plus or minus the activation-memory headroom you spend on
+larger batches. That's what's actually attributable to the precision
+choice.
 
 ---
 

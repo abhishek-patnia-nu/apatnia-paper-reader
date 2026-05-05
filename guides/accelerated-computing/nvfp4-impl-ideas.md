@@ -37,12 +37,9 @@ orthogonal concerns:
 | What precision each `te.Linear` runs in *per step* | `forward_context` recipe |
 | How the recipe changes *over training* | Step-aware `active_recipe` (NVFP4 → MXFP8 mid-training) |
 
-The plugin below packages all three into one class. Optional extras:
-
-- **MXFP8 tail blocks** instead of BF16 fallback — a model-side nested
-  `te.autocast` (§1.6).
-- **Pre-flight audit** — sanity-check coverage before paying for a
-  full run (§1.4).
+The plugin below packages all three into one class. Plus a
+**pre-flight audit** (§1.4) for sanity-checking coverage before
+paying for a full run.
 
 ### 1.1 Layer Predicates
 
@@ -84,11 +81,37 @@ def by_block_index(
     max_block_idx: int,
     block_segment: str = "blocks",
 ) -> LinearPredicate:
-    """Keep NVFP4 on Linears in transformer blocks 0..max_block_idx-1.
+    """Keep NVFP4 on Linears whose containing block has index
+    ``< max_block_idx``.
+
+    Implementation parses the layer's dotted name. Assumes the
+    standard transformer-block convention:
+
+      * Blocks are stored under a container named ``block_segment``
+        on the model — typically ``model.blocks``.
+      * That container is either an ``nn.ModuleDict`` keyed by
+        ``str(block_idx)`` (so paths look like ``blocks.0.<...>``,
+        ``blocks.1.<...>``, …) or an ``nn.ModuleList`` indexed by
+        int (which produces the same dotted-path layout via
+        ``named_modules()``).
+      * Each block sets ``self.block_idx = block_idx`` in
+        ``__init__``. This is a common pattern in transformer
+        codebases — the block needs to pass its index down to
+        sub-modules (e.g. for RoPE caches keyed by layer, or for
+        debugging) and storing it as an attribute is the obvious way.
+
+    The dotted-name path and the ``block_idx`` attribute both
+    encode the same information, since the storage container is
+    keyed by the same index. We parse the path here rather than
+    reading the attribute so the predicate stays a pure function
+    of ``(name, layer)`` — no need to take a model handle at
+    construction time. If your blocks live somewhere unusual
+    (e.g. nested under ``model.transformer.layers``) override
+    ``block_segment`` accordingly.
 
     Layers that aren't inside a numbered block (embeddings, final
-    norm, lm_head) return ``True`` by default — compose with another
-    predicate for those cases.
+    norm, ``lm_head``) return ``True`` by default — compose with
+    another predicate to control those cases.
     """
     def pred(name, layer):
         parts = name.split(".")
@@ -132,18 +155,48 @@ small per-block projections benefit most from this.
 ### 1.2 The Plugin
 
 ```python
-from contextlib import ExitStack
+from collections.abc import Mapping
+from contextlib import AbstractContextManager, ExitStack
 
 import torch
 from lightning.fabric.plugins.precision.transformer_engine import (
     TransformerEnginePrecision as FabricTEPrecision,
 )
 from lightning.fabric.plugins.precision.utils import _DtypeContextManager
+from lightning.fabric.utilities.rank_zero import rank_zero_info
 from lightning.pytorch.plugins.precision.precision import Precision
 
 
 class NVFP4ProductionPrecision(Precision, FabricTEPrecision):
     """Filter + dynamic-recipe NVFP4 plugin.
+
+    Differences from the stock ``TransformerEnginePrecision``:
+      * Predicate-based ``convert_module`` (only replace Linears that
+        pass ``replacement_filter``).
+      * Dynamic recipe via ``active_recipe`` — supports a single
+        mid-training switch from NVFP4 → MXFP8.
+      * Stricter dim check: NVFP4 needs both dims divisible by 16
+        (parent uses the looser FP8 rule of in%8 / out%16).
+      * ``module_init_context`` disabled — see method docstring.
+      * ``convert_input`` / ``convert_output`` disabled. The parent
+        casts every batch to ``weights_dtype`` and every output back
+        to ``torch.get_default_dtype()`` on the way out. ``torch.autocast``
+        inside ``forward_context`` already handles op-boundary casts
+        for the layers that need it; this extra blanket cast is
+        wasteful (it touches every per-batch tensor on the host loop)
+        and also surprising — e.g. with ``weights_dtype=torch.float32``
+        the parent silently up-casts BF16 inputs to FP32. Disable both
+        and let the model decide what to do with its inputs.
+      * Only ``nn.Linear`` is replaced; ``nn.LayerNorm`` is left alone
+        (parent replaces both). LN runs in FP32 outside autocast either
+        way, so the only delta is ``te.LayerNorm``'s slightly faster
+        kernel — keep it explicit if you want LN-Linear fusion via
+        ``te.LayerNormLinear`` at model build time.
+
+    ``te.Linear`` does **not** subclass ``torch.nn.Linear``; downstream
+    code that does ``isinstance(layer, nn.Linear)`` will silently skip
+    converted layers. Run any inspection helpers (e.g. the audit in
+    §1.4) on a pristine pre-conversion model.
 
     Args:
         weights_dtype: On-device parameter dtype. ``torch.float32`` for
@@ -156,8 +209,11 @@ class NVFP4ProductionPrecision(Precision, FabricTEPrecision):
             ``weights_dtype=torch.float32``, otherwise the parent
             class defaults it to ``weights_dtype`` and skipped Linears
             silently run in FP32 (see §2.8).
-        nvfp4_recipe: Recipe used while ``current_step < switch_step``.
-            Defaults to ``NVFP4BlockScaling()``.
+        nvfp4_recipe: Recipe object (e.g. ``NVFP4BlockScaling()``) used
+            while ``current_step < switch_step``. Must be a recipe
+            instance, **not** a dict — the parent class hardcodes
+            dict normalization to FP8 ``DelayedScaling`` and would
+            silently downgrade an NVFP4 dict to FP8.
         decay_recipe: Recipe used once ``current_step >= switch_step``.
             Defaults to ``MXFP8BlockScaling()``.
         switch_step: Global step at which to swap recipes. ``None`` =
@@ -183,6 +239,20 @@ class NVFP4ProductionPrecision(Precision, FabricTEPrecision):
             NVFP4BlockScaling,
             MXFP8BlockScaling,
         )
+        # Defensive: parent's __init__ has a ``isinstance(recipe, Mapping)
+        # → DelayedScaling(**recipe)`` branch that hardcodes FP8. Passing
+        # a dict here would silently train in FP8 instead of NVFP4.
+        if isinstance(nvfp4_recipe, Mapping):
+            raise TypeError(
+                "nvfp4_recipe must be a recipe object (e.g. "
+                "NVFP4BlockScaling()), not a Mapping/dict — the parent "
+                "class would normalize a dict to DelayedScaling (FP8)."
+            )
+        if isinstance(decay_recipe, Mapping):
+            raise TypeError(
+                "decay_recipe must be a recipe object (e.g. "
+                "MXFP8BlockScaling()), not a Mapping/dict."
+            )
         super().__init__(
             weights_dtype=weights_dtype,
             recipe=nvfp4_recipe or NVFP4BlockScaling(),
@@ -204,20 +274,125 @@ class NVFP4ProductionPrecision(Precision, FabricTEPrecision):
         return self.recipe
 
     def forward_context(self):
+        """The three-layer context stack that every training step runs in.
+
+        Each manager touches a different piece of global state, and
+        all three are needed for an FP4 training step:
+
+        1. ``_DtypeContextManager(weights_dtype)`` sets
+           ``torch.get_default_dtype()`` to ``weights_dtype``. This
+           affects *new tensor allocations inside the forward* — e.g.
+           if the model does ``torch.zeros(...)`` for a buffer or a
+           position-encoding cache, that tensor will be created in
+           ``weights_dtype``. It does **not** cast existing tensors.
+
+        2. ``torch.autocast("cuda", dtype=fallback_compute_dtype)``
+           is the **fallback for any op not handled by te.fp8_autocast**
+           — not only ``nn.Linear`` modules we skipped from
+           ``te.Linear`` conversion, but also attention (softmax,
+           scaled-dot-product), norms (LayerNorm, RMSNorm),
+           elementwise ops on outputs of ``te.Linear``, etc. PyTorch's
+           autocast registry catches these at the op boundary and
+           casts inputs to ``fallback_compute_dtype``. With
+           ``fallback_compute_dtype=torch.bfloat16`` this matches
+           ``MixedPrecision("bf16-mixed")`` semantics for those ops,
+           which is what makes the apples-to-apples comparison in
+           §2 valid.
+
+        3. ``te.fp8_autocast(enabled=True, fp8_recipe=active_recipe)``
+           sets a TE thread-local recipe that ``te.Linear.forward()``
+           reads to decide its quantization path (NVFP4 vs MXFP8 vs
+           plain FP8 etc.). ``self.active_recipe`` is read fresh on
+           every call to ``forward_context``, which is what makes the
+           mid-training NVFP4 → MXFP8 switch work without rebuilding
+           any module.
+
+        Order of ``enter_context`` calls doesn't matter for
+        correctness (each manager touches independent state), but
+        matches the stock plugin's order for readability: dtype
+        context outermost, ``torch.autocast`` middle, ``te.fp8_autocast``
+        innermost.
+
+        Critical detail: the backward pass runs **outside** this
+        context (Lightning exits the context after the training_step,
+        before ``loss.backward()``). TE handles this correctly
+        because the saved tensors and autograd Function objects
+        already carry the recipe that was active during forward —
+        backward re-applies it automatically.
+        """
         import transformer_engine.pytorch as te
 
         stack = ExitStack()
+
+        # (1) Default dtype for *new* tensor allocations during forward.
+        # Affects e.g. ``torch.zeros(...)`` calls inside the model.
+        # Does NOT cast existing parameters or activations.
         stack.enter_context(_DtypeContextManager(self.weights_dtype))
+
+        # (2) Fallback autocast for ops without an FP4/FP8 path in TE
+        # (attention, norms, elementwise ops, skipped ``nn.Linear``s,
+        # etc.). Matches what ``MixedPrecision("bf16-mixed")`` does
+        # when ``fallback_compute_dtype=torch.bfloat16``.
         stack.enter_context(
             torch.autocast(device_type="cuda", dtype=self.fallback_compute_dtype)
         )
+
+        # (3) TE quantization recipe. Read ``self.active_recipe``
+        # fresh so a recipe swap (NVFP4 → MXFP8 at ``switch_step``)
+        # takes effect on the next training step without any
+        # ``convert_module`` rerun. Innermost wins for nested
+        # ``te.autocast`` overrides (see §4.3).
         stack.enter_context(
             te.fp8_autocast(enabled=True, fp8_recipe=self.active_recipe)
         )
+
         return stack
+
+    def module_init_context(self) -> AbstractContextManager:
+        """Disable the parent's global ``nn.Linear`` → ``te.Linear``
+        class replacement.
+
+        The parent uses ``_ClassReplacementContextManager`` to monkey-
+        patch ``torch.nn.Linear`` at construction time. That happens
+        *before* ``convert_module``, so the predicate filter would
+        never get a chance to run — every Linear built under
+        ``fabric.init_module()`` would become ``te.Linear`` regardless
+        of ``replacement_filter``. Force everyone through the
+        ``convert_module`` path so the predicate is always honored.
+        """
+        return self.tensor_init_context()
+
+    def convert_input(self, data: Any) -> Any:
+        """Pass batches through untouched.
+
+        The parent casts every floating-point tensor in the batch to
+        ``weights_dtype``. ``torch.autocast`` inside ``forward_context``
+        already does op-boundary casts where they're needed; this
+        blanket pre-cast adds host-loop overhead and can surprise the
+        model (e.g. up-casting BF16 numerical features to FP32 when
+        ``weights_dtype=torch.float32``).
+        """
+        return data
+
+    def convert_output(self, data: Any) -> Any:
+        """Pass outputs through untouched (see ``convert_input``)."""
+        return data
 
     def convert_module(self, module: torch.nn.Module) -> torch.nn.Module:
         import transformer_engine.pytorch as te
+
+        # Defensive guard from stock plugin: don't try to re-replace
+        # modules that are already TE (e.g. loaded from a checkpoint
+        # built with TE layers). Just cast and return.
+        if any(
+            "transformer_engine.pytorch" in m.__module__
+            for m in module.modules()
+        ):
+            rank_zero_info(
+                "NVFP4ProductionPrecision: model already contains "
+                "TransformerEngine layers; skipping convert_module."
+            )
+            return module.to(dtype=self.weights_dtype)
 
         candidates = [
             (n, m) for n, m in module.named_modules()
@@ -229,7 +404,8 @@ class NVFP4ProductionPrecision(Precision, FabricTEPrecision):
                 and not self.replacement_filter(name, child)
             ):
                 continue
-            # NVFP4 needs both dims divisible by 16.
+            # Stricter than the parent's FP8 check (in%8 / out%16) —
+            # NVFP4 block size is 16 along both dims.
             if child.in_features % 16 != 0 or child.out_features % 16 != 0:
                 continue
             parent_name, _, attr = name.rpartition(".")
@@ -251,6 +427,24 @@ The class is mostly composition: `convert_module` is predicate-filtered
 layer replacement; `forward_context` is dynamic recipe selection. The
 two features are independent — set `replacement_filter=None` for full
 coverage, or `switch_step=None` for a static recipe.
+
+Four guards inherited from analyzing the stock plugin's behavior:
+
+- `module_init_context` is overridden to disable global
+  `nn.Linear` → `te.Linear` interception during model construction.
+  Without this override, building the model under
+  `fabric.init_module()` would silently replace **every** Linear,
+  ignoring `replacement_filter`.
+- `convert_input` / `convert_output` overridden to no-ops. The
+  parent's per-batch dtype cast is redundant with `torch.autocast`,
+  costs host-loop time on every batch, and can surprise the model
+  (e.g. up-casting BF16 numerical features to FP32 when
+  `weights_dtype=torch.float32`).
+- `convert_module` short-circuits if the model already contains TE
+  modules. Matches the stock plugin's behavior.
+- `__init__` rejects dict recipes. The parent class hardcodes
+  `dict → DelayedScaling` (FP8); accepting the dict would silently
+  downgrade an NVFP4 config to FP8.
 
 ### 1.3 Step-Tracking Callback
 
@@ -278,7 +472,14 @@ directly from the training loop.
 
 Predicate bugs are silent — a typo can leave 90% of the model in BF16
 and you won't notice until you compare against an unfiltered baseline.
-Audit the filter against the actual model before training:
+Audit the filter against the actual model before training.
+
+> **Run the audit on a pristine pre-conversion model.** `te.Linear`
+> does not subclass `torch.nn.Linear`, so the
+> `isinstance(child, torch.nn.Linear)` check below silently skips
+> every layer that has already been converted. Build a fresh model
+> for the audit; do **not** reuse a model that has already been
+> through `plugin.convert_module()`.
 
 ```python
 import json
@@ -391,41 +592,7 @@ trainer = Trainer(
 trainer.fit(model, datamodule)
 ```
 
-### 1.6 Optional: MXFP8 Tail via Model-Side Autocast
-
-The plugin alone leaves the last `(1 − 0.85) × n_blocks` blocks
-running in *whatever the predicate excludes them into*. If you skip
-them via `by_block_index`, they stay as `nn.Linear` → BF16 fallback.
-To run them in MXFP8 instead (closer to the paper's exact numerics),
-let the plugin convert them to `te.Linear` and override the recipe
-locally in the model's forward:
-
-```python
-import transformer_engine.pytorch as te
-from transformer_engine.common.recipe import MXFP8BlockScaling
-
-
-class MyModel(L.LightningModule):
-    HIGH_PREC_START = 24      # last 4 of 28 blocks → MXFP8
-    HIGH_PREC_RECIPE = MXFP8BlockScaling()
-
-    def forward(self, x):
-        for i, block in enumerate(self.blocks):
-            if i >= self.HIGH_PREC_START:
-                # Inner autocast wins over the plugin's outer one.
-                with te.autocast(recipe=self.HIGH_PREC_RECIPE):
-                    x = block(x)
-            else:
-                x = block(x)
-        return x
-```
-
-The inner `te.autocast` overrides whatever recipe the plugin's
-`forward_context()` set for the outer scope, so the tail blocks run
-in MXFP8 while the bulk runs in NVFP4 (or MXFP8 after the
-mid-training switch — the plugin's behavior is unchanged).
-
-### 1.7 Mapping to the Paper
+### 1.6 Mapping to the Paper
 
 | Paper element | Plugin knob |
 |---|---|
@@ -433,7 +600,7 @@ mid-training switch — the plugin's behavior is unchanged).
 | BF16 fallback for skipped Linears | `fallback_compute_dtype=torch.bfloat16` |
 | NVFP4 GEMMs in most layers | `nvfp4_recipe` + `convert_module` |
 | Stochastic rounding, RHT, 2D weight scaling | `NVFP4BlockScaling()` defaults |
-| Last ~15% of blocks in higher precision | `by_block_index` filter (BF16 tail) **or** §1.6 (MXFP8 tail) |
+| Last ~15% of blocks in higher precision | `by_block_index` filter (skipped Linears run in BF16 fallback) |
 | `lm_head` excluded from FP4 | `not_by_name_pattern("lm_head")` filter |
 | NVFP4 → MXFP8 mid-training switch | `switch_step` + `decay_recipe` + `StepTracker` |
 | TP/SP all-reduce of amax | Automatic in `te.Linear` (§3) |
@@ -441,7 +608,7 @@ mid-training switch — the plugin's behavior is unchanged).
 | Skip layers below the FP4 payback threshold | `by_min_size` filter (empirical) |
 | Verify coverage before training | `audit_replacements()` pre-flight |
 
-### 1.8 Knobs to Tune
+### 1.7 Knobs to Tune
 
 - **`weights_dtype`** — `torch.float32` for paper-faithful FP32
   master weights; `torch.bfloat16` for BF16-throughout. Cost of FP32:
@@ -487,11 +654,12 @@ paper-faithful config (`weights_dtype=fp32`,
 # bf16-mixed
 torch.autocast("cuda", dtype=torch.bfloat16)
 
-# NVFP4 paper-mode
+# NVFP4 paper-mode (innermost → outermost effect; see §1.2 forward_context docstring)
 ExitStack:
-    _DtypeContextManager(weights_dtype)                       # default tensor dtype
-    torch.autocast("cuda", dtype=fallback_compute_dtype)      # fallback for skipped layers
-    te.fp8_autocast(enabled=True, fp8_recipe=active_recipe)   # NVFP4 or MXFP8
+    _DtypeContextManager(weights_dtype)                       # default dtype for new tensor allocs in forward
+    torch.autocast("cuda", dtype=fallback_compute_dtype)      # fallback for ops not handled by te.fp8_autocast
+                                                              #   (attention, norms, skipped nn.Linears, etc.)
+    te.fp8_autocast(enabled=True, fp8_recipe=active_recipe)   # NVFP4 or MXFP8 — only te.Linear reads this
 ```
 
 ### 2.3 At a Linear's Forward
@@ -712,6 +880,28 @@ This is the right place for the `nn.Linear` → `te.Linear` swap.
 `te.Linear` is the same class for FP8 and FP4 — the recipe (set by
 `forward_context`) decides which precision format runs at GEMM time.
 
+`module_init_context()` is a *second* entry point for layer
+replacement, fired when the user constructs a model under
+`fabric.init_module()`:
+
+```python
+with fabric.init_module():     # plugin's module_init_context is active
+    model = MyModel(...)       # nn.Linear constructions get redirected
+```
+
+The stock `TransformerEnginePrecision` overrides this hook to
+monkey-patch `torch.nn.Linear` → `te.Linear` globally for the
+duration of the context (via `_ClassReplacementContextManager`). The
+upside is no clone-and-replace pass later; the downside is that any
+predicate filter on `convert_module` is bypassed entirely — every
+Linear becomes `te.Linear` regardless of `replacement_filter`.
+
+For predicate-based plugins (§1.2) the right fix is to override
+`module_init_context()` to return only the dtype context manager,
+*not* the class replacement. That forces every layer through
+`convert_module` so the predicate is always honored, at the cost of
+the init-time fast path. The §1.2 plugin does this.
+
 ### 4.2 Trainer Loop Hook Order
 
 For a single training step:
@@ -779,8 +969,10 @@ Backward computes two GEMMs (dgrad and wgrad), uses the saved
 rowwise/columnwise quantized copies, applies stochastic rounding when
 quantizing `grad_output` to FP4, and applies RHT to wgrad inputs.
 
-**Nested autocasts stack — innermost recipe wins.** This is how the
-§1.6 model-side override works:
+**Nested autocasts stack — innermost recipe wins.** Useful if a
+model wants to override the plugin's recipe for a specific block
+range (e.g. running the tail in MXFP8 while the bulk stays in
+NVFP4):
 
 ```python
 with te.autocast(recipe=NVFP4BlockScaling()):     # outer (plugin)
@@ -878,28 +1070,39 @@ amortized scale overhead).
 
 ## 6. Open Implementation Questions
 
-1. **Recipe type checking in `__init__`:** The current plugin defaults
-   unknown recipes to `DelayedScaling` via the dict-to-dataclass path.
-   An NVFP4-aware plugin should also accept `NVFP4BlockScaling` dicts,
-   or always pass pre-built recipe objects.
+1. **Step-aware recipe via callback feels indirect.** The §1.3
+   `StepTracker` callback pushes `trainer.global_step` into the
+   plugin once per batch; `active_recipe` then reads that field. This
+   works but couples the plugin to a specific callback. A cleaner
+   alternative would be a `set_step()` API that the trainer calls
+   directly, or having the plugin look at
+   `trainer.precision_plugin._connected_trainer.global_step` (if
+   such a back-reference existed). Worth revisiting if the callback
+   approach turns out to be brittle.
 
-2. **Precision switching state:** Mutating `self.recipe` mid-training
-   works because `forward_context()` reads it fresh each call. But
-   this is implicit. Should we formalize a `set_recipe()` API with
-   validation?
+2. **Checkpoint compatibility across recipe switches.** Switching
+   from NVFP4 to MXFP8 mid-training changes the quantization state.
+   TE layers cache quantized copies — verify that recipe changes
+   correctly invalidate these caches, especially across a
+   save/restore cycle that crosses `switch_step`.
 
-3. **Checkpoint compatibility:** Switching from NVFP4 to MXFP8
-   mid-training changes the quantization state. TE layers cache
-   quantized copies — verify that recipe changes correctly invalidate
-   these caches.
-
-4. **TE parallel layers vs `convert_module`:** For tensor-parallel
+3. **TE parallel layers vs `convert_module`.** For tensor-parallel
    setups, `convert_module`'s `nn.Linear` → `te.Linear` swap isn't
    sufficient — we need `te.ColumnParallelLinear` /
    `te.RowParallelLinear`. This likely means the model must be built
-   with TE layers from the start, not converted.
+   with TE parallel layers from the start, not converted. The §1.2
+   plugin's `module_init_context` override (which disables TE class
+   replacement at init time) does **not** help here — TE parallel
+   layers aren't drop-in replacements for `nn.Linear`.
 
-5. **Monitoring quantization error:** TE doesn't expose per-layer
+4. **LayerNorm replacement.** §1.2 deliberately leaves
+   `nn.LayerNorm` alone; the stock plugin replaces it with
+   `te.LayerNorm`. If profiling shows the LayerNorm kernel matters,
+   the right fix is `te.LayerNormLinear` fusion at model build time
+   rather than independent LN replacement (which only buys a slightly
+   faster norm kernel).
+
+5. **Monitoring quantization error.** TE doesn't expose per-layer
    quantization error metrics out of the box. For debugging
    convergence issues, we may need hooks that compare pre-quantization
    and dequantized values.

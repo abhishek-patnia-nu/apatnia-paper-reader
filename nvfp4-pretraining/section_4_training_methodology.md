@@ -31,7 +31,18 @@ And here's the full compute flow for one NVFP4 linear layer (Figure 5):
 
 You already know mixed precision training -- using lower precision for speed while keeping master weights in FP32. This section is about *which layers* can tolerate FP4 and which can't.
 
-### What stays in FP4
+There are two **independent** decisions hiding inside that question, and it's easy to confuse them:
+
+| Decision | Question | Granularity |
+|---|---|---|
+| **(a) What kind of *op*?** | Which operations run as NVFP4 GEMMs vs. stay BF16/FP32? | Op type |
+| **(b) Which *blocks*?** | Among FP4-eligible `nn.Linear` modules, which ones actually get swapped vs. held back? | Per-block in the model |
+
+(a) is fixed by the recipe: only `nn.Linear` GEMMs are FP4-eligible; everything else (embeddings, lm_head, norms, softmax, activations, attention's internal batched matmuls) stays BF16. (b) is a knob: even among FP4-eligible `nn.Linear`s, the first few and last few blocks of the model are kept in BF16 because they're too sensitive.
+
+We'll cover (a) at the op level, then walk through every module of a standard Transformer block to show exactly which `nn.Linear`s are eligible. Then (b): which blocks stay BF16 entirely.
+
+### Decision (a): Which OPS run in FP4
 
 Only the **GEMM operations inside linear layers** are computed in FP4. Each linear layer has three GEMMs:
 
@@ -46,33 +57,96 @@ flowchart LR
     end
 ```
 
-These three GEMMs are the workhorses -- they consume FP4 inputs and produce BF16/FP32 outputs.
+These three GEMMs are the workhorses -- they consume FP4 inputs and produce BF16/FP32 outputs. Everything else keeps its original precision:
 
-### What stays in higher precision
+- **Token embeddings (`nn.Embedding`)** → BF16. Lookup, not a GEMM.
+- **LM head / output projection to vocab** → BF16. Even though it's literally `nn.Linear`, it produces vocab-scale logits feeding directly into the loss, so the paper keeps it in BF16.
+- **Normalization layers (RMSNorm, LayerNorm)** → BF16/FP32. Reduction op, not a GEMM.
+- **Non-linearities (Squared ReLU, GELU, SiLU)** → BF16. Element-wise.
+- **Attention internals (softmax, QK^T scores, AV output)** → BF16. *See gotcha below.*
+- **Master weights and optimizer states** → FP32.
+- **Weight gradient accumulators** → FP32.
+- **Tensor-parallel reductions** → BF16.
 
-Everything else keeps its original precision:
+> **Subtle but critical:** the **QK^T and AV matmuls inside attention** are NOT `nn.Linear` modules -- they are batched matmuls (`bmm` / `einsum`) over the already-projected Q, K, V activation tensors. They stay BF16. The four `nn.Linear` modules *surrounding* attention -- `Wq`, `Wk`, `Wv`, `Wo` -- DO get NVFP4'd.
+>
+> If you swap modules by `isinstance(mod, nn.Linear)`, you get this right automatically. If you've hand-written attention with custom matmuls (e.g. via `torch.matmul` on per-head tensors), be careful not to FP4 the QK^T or AV ops.
 
-- **Embeddings and output projection head** → BF16
-- **Normalization layers (RMSNorm)** → BF16/FP32
-- **Non-linearities (Squared ReLU)** → BF16
-- **Attention (softmax, QK, AV batched GEMMs)** → BF16
-- **Master weights and optimizer states** → FP32
-- **Weight gradients for accumulation** → FP32
-- **Tensor-parallel reductions** → BF16
+### Decision (a) applied to a standard Transformer block
 
-### Which linear layers are too sensitive for FP4
+Here's the per-module breakdown for one block of a typical decoder-only Transformer (Llama-style, with SwiGLU FFN). Green = FP4-eligible (`nn.Linear`); white = BF16:
 
-The paper finds that **the final few blocks cause divergence** when quantized to FP4. From the ablation (Appendix E.2):
+```mermaid
+flowchart TB
+    n1["RMSNorm<br/>(BF16)"] --> wq["Wq: nn.Linear<br/><b>NVFP4</b>"]
+    n1 --> wk["Wk: nn.Linear<br/><b>NVFP4</b>"]
+    n1 --> wv["Wv: nn.Linear<br/><b>NVFP4</b>"]
+    wq --> qkt["QK^T<br/>(BF16 bmm)"]
+    wk --> qkt
+    qkt --> sm["softmax<br/>(BF16)"]
+    sm --> av["AV<br/>(BF16 bmm)"]
+    wv --> av
+    av --> wo["Wo: nn.Linear<br/><b>NVFP4</b>"]
+    wo --> resid1["+ residual"]
+    resid1 --> n2["RMSNorm<br/>(BF16)"]
+    n2 --> w1["W_up: nn.Linear<br/><b>NVFP4</b>"]
+    n2 --> wg["W_gate: nn.Linear<br/><b>NVFP4</b>"]
+    w1 --> act["SiLU<br/>(BF16)"]
+    wg --> act
+    act --> w2["W_down: nn.Linear<br/><b>NVFP4</b>"]
+    w2 --> resid2["+ residual"]
+
+    style wq fill:#a4d4a4,color:#000
+    style wk fill:#a4d4a4,color:#000
+    style wv fill:#a4d4a4,color:#000
+    style wo fill:#a4d4a4,color:#000
+    style w1 fill:#a4d4a4,color:#000
+    style wg fill:#a4d4a4,color:#000
+    style w2 fill:#a4d4a4,color:#000
+```
+
+The complete checklist for a standard Transformer:
+
+| Module | What it is | Replace with NVFP4? | Why / why not |
+|---|---|---|---|
+| Token embedding (`nn.Embedding`) | Lookup table | **No** | Not `nn.Linear`; gather, not GEMM |
+| Pre-attention RMSNorm | Reduce + scale | **No** | Not a GEMM |
+| `Wq` (Q projection) | `nn.Linear` | **Yes** | Matmul, robust to FP4 |
+| `Wk` (K projection) | `nn.Linear` | **Yes** | Matmul, robust to FP4 |
+| `Wv` (V projection) | `nn.Linear` | **Yes** | Matmul, robust to FP4 |
+| QK^T scores | Batched matmul | **No** | Inside attention, not `nn.Linear` |
+| `softmax` | Element-wise normalize | **No** | Numerically sensitive |
+| AV output | Batched matmul | **No** | Inside attention, not `nn.Linear` |
+| `Wo` (attention output projection) | `nn.Linear` | **Yes** | Matmul, robust to FP4 |
+| Pre-FFN RMSNorm | Reduce + scale | **No** | Not a GEMM |
+| `W_up` (FFN input projection) | `nn.Linear` | **Yes** | Largest matmul in the block |
+| `W_gate` (FFN gate, GLU variants) | `nn.Linear` | **Yes** | Largest matmul in the block |
+| Activation (SiLU/GELU/Squared ReLU) | Element-wise | **No** | Not a GEMM |
+| `W_down` (FFN output projection) | `nn.Linear` | **Yes** | Largest matmul in the block |
+| Final RMSNorm (post-blocks) | Reduce + scale | **No** | Not a GEMM |
+| `lm_head` (logits projection) | `nn.Linear` | **No** | Output-sensitive; vocab-scale logits feed the loss |
+
+So in a standard SwiGLU Transformer block, **7 `nn.Linear` modules** (`Wq`, `Wk`, `Wv`, `Wo`, `W_up`, `W_gate`, `W_down`) are FP4-eligible -- but only if the block as a whole isn't held back by decision (b). Variants:
+
+- **Fused QKV** (one `nn.Linear` producing concatenated Q, K, V): counts as one FP4-eligible module instead of three.
+- **Plain (non-GLU) FFN**: drop `W_gate`; just `W_up` and `W_down`.
+- **Tied embeddings** (`lm_head` shares weights with the embedding): the tied tensor stays BF16 since both endpoints are BF16.
+- **MoE blocks**: each expert's three FFN linears are FP4-eligible the same way. The router (`nn.Linear` mapping hidden → n_experts) is technically eligible, but it's tiny -- common practice is to keep it in BF16 since the FP4 win is negligible at small sizes. The paper's model isn't MoE.
+- **Hybrid Mamba/Attention blocks** (like the paper's Nemotron-H 12B): same rule applies block by block. Mamba2 blocks have input/output `nn.Linear`s that go NVFP4; the SSM scan itself stays BF16 (it's a structured recurrence, not a GEMM).
+
+### Decision (b): Which BLOCKS keep ALL their `nn.Linear`s in BF16
+
+Even among FP4-eligible `nn.Linear` modules, the paper finds **the first few and last few blocks cause divergence** when quantized to FP4. From the ablation (Appendix E.2):
 
 - All layers in FP4 → **diverges**
 - Last 1 block in BF16 → **diverges**
 - Last 2 blocks in BF16 → **diverges**
 - Last 4 blocks in BF16 → **stable**
-- First 4 blocks in BF16 (last in FP4) → **diverges**
+- First 4 blocks in BF16 (last still in FP4) → **diverges**
 
-The pattern is clear: sensitivity is concentrated at the end of the network. The paper observes that final layers have **larger quantization errors in weight gradients** -- they need more dynamic range and mantissa precision than FP4 can provide.
+The pattern is clear: sensitivity is concentrated at the **end** of the network. The paper observes that final layers have **larger quantization errors in weight gradients** -- they need more dynamic range and mantissa precision than FP4 can provide. The first-block guard is more of a belt-and-suspenders move; the late-block guard is the load-bearing one.
 
-For the 12B model, they conservatively keep the first 2 + last 8 blocks in BF16 (16% of linear layers). But Figure 4 shows that even just the last 4 blocks in BF16 works, so there's room to push more of the network to FP4.
+For the 12B model, they conservatively keep the **first 2 + last 8 blocks** in BF16 (≈16% of linear layers; 104 of 124 in FP4). Figure 4 shows that even just the last 4 blocks in BF16 works, so there's room to push more of the network to FP4 if you want to be aggressive.
 
 ```mermaid
 flowchart LR
@@ -80,6 +154,37 @@ flowchart LR
         A["Blocks 1-2<br/><b>BF16</b><br/>(conservative)"] --> B["Blocks 3-54<br/><b>NVFP4</b><br/>(84% of linear layers)"] --> C["Blocks 55-62<br/><b>BF16</b><br/>(required for stability)"]
     end
 ```
+
+### Putting (a) and (b) together: the swap recipe
+
+A correct module-replacement predicate combines both decisions:
+
+```python
+import torch.nn as nn
+import transformer_engine.pytorch as te
+
+def should_use_nvfp4(name: str, mod: nn.Module, n_blocks: int,
+                     bf16_first: int = 2, bf16_last: int = 8) -> bool:
+    if not isinstance(mod, nn.Linear):
+        return False                          # (a) not a GEMM
+    if "lm_head" in name or "embed" in name:
+        return False                          # (a) output/input projection -> BF16
+    block_idx = parse_block_idx(name)         # e.g. "model.layers.5.mlp.up_proj" -> 5
+    if block_idx is None:
+        return False                          # not inside a transformer block -> BF16
+    if block_idx < bf16_first:
+        return False                          # (b) early-block guard
+    if block_idx >= n_blocks - bf16_last:
+        return False                          # (b) late-block guard (the load-bearing one)
+    return True
+
+for name, mod in list(model.named_modules()):
+    if should_use_nvfp4(name, mod, n_blocks=62):
+        replace_with(mod, te.Linear(mod.in_features, mod.out_features,
+                                    bias=mod.bias is not None))
+```
+
+For production-grade variants of this predicate (size-based filters, regex patterns, MoE-aware selection, named-pattern guards, plus a Lightning plugin wrapping all of it) see [`guides/accelerated-computing/nvfp4-impl-ideas.md`](../guides/accelerated-computing/nvfp4-impl-ideas.md).
 
 ---
 

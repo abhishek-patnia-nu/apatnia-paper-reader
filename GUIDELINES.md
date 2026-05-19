@@ -38,6 +38,7 @@ For each section:
 ## Papers
 
 - [Pretraining Large Language Models with NVFP4](nvfp4-pretraining/) -- NVIDIA, 2025. FP4 training at scale.
+- [PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel](pytorch-fsdp/) -- Meta AI, 2023. ZeRO-style parameter sharding in PyTorch.
 
 ## Knowledge Profile
 

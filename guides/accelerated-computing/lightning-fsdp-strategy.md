@@ -17,6 +17,7 @@ This guide complements the [PyTorch FSDP paper notes](../../pytorch-fsdp/) (the 
 3. [Constructor arguments — the full inventory](#section-3-constructor-arguments--the-full-inventory)
 4. [Sharding strategies: what gets split where](#section-4-sharding-strategies-what-gets-split-where)
 5. [Auto-wrap policy: controlling FSDP granularity](#section-5-auto-wrap-policy-controlling-fsdp-granularity)
+   - [Excluding modules from FSDP (`ignored_modules` / `ignored_states`)](#excluding-modules-from-fsdp-ignored_modules--ignored_states)
 6. [Activation checkpointing policy](#section-6-activation-checkpointing-policy)
 7. [Mixed precision and `FSDPPrecision`](#section-7-mixed-precision-and-fsdpprecision)
 8. [Checkpointing: `state_dict_type`](#section-8-checkpointing-state_dict_type)
@@ -408,6 +409,84 @@ If **you already wrapped** submodules in `configure_sharded_model`, Lightning de
 - If **OOM persists**, combine finer wrapping with `activation_checkpointing_policy` (§6).
 - If **step time is communication-bound**, coarsen wrapping (fewer FSDP units).
 
+### Excluding modules from FSDP (`ignored_modules` / `ignored_states`)
+
+A frequent need: *"I want FSDP for most of the model, but module X should be left alone."* There are two **very different** ways to "exclude" a module, and confusing them is a common source of bugs.
+
+#### Critical distinction: "not wrapped" ≠ "not sharded"
+
+| Lever | Mechanism | Are the module's params still **sharded**? | Are gradients still **reduced** across ranks? |
+|---|---|---|---|
+| **Omit class from `auto_wrap_policy`** | Module is folded into its nearest enclosing FSDP unit | **Yes** — its params join the parent unit's FlatParameter and are sharded | Yes (by the parent unit) |
+| **Custom callable returns `False`** for the subtree | Same as above | **Yes** | Yes |
+| **`ignored_modules=[mod]`** | Module is fully excluded from this FSDP instance | **No** — full unsharded params live on every rank | **No** — FSDP does not touch them |
+| **`ignored_states=[param_or_buffer]`** | Specific params/buffers excluded (finer-grained) | **No** for those tensors | **No** |
+
+The trap: **removing a class from the wrap policy does not stop its parameters from being sharded.** It only changes *granularity* — the params get absorbed into the parent FSDP unit's flat parameter and are still split across ranks. If you genuinely want FSDP to leave a module untouched (full replica on every rank, no all-gather, no reduce-scatter, no mixed-precision cast), you need `ignored_modules` or `ignored_states`.
+
+> From the PyTorch docstring: `ignored_modules` exists "to avoid sharding specific parameters at module granularity" — i.e. the params stay full even though everything around them is sharded.
+
+#### What `ignored_modules` actually does
+
+When you pass `ignored_modules=[some_submodule]`:
+
+- The submodule's **own parameters and all its descendants' parameters and buffers** are excluded from this FSDP instance.
+- Those tensors are **not flattened, not sharded, not all-gathered, not reduce-scattered.** Each rank keeps the full tensor.
+- FSDP's **mixed precision does not cast them** — they keep whatever dtype they were initialized in. (This is the canonical way to force a submodule to stay fp32 while the rest runs bf16.)
+- **FSDP does not reduce their gradients.** ⚠️ If those params are trainable and replicated across data-parallel ranks, the ranks will **diverge** unless you sync them yourself (wrap that submodule in `DDP`, or manually all-reduce its grads). For a frozen / eval-only submodule this is a non-issue.
+
+`ignored_states` is the newer, unified form. It accepts **either** an iterable of parameters **or** an iterable of modules, with the same semantics. You may set **only one** of `ignored_modules` / `ignored_states` — passing both raises.
+
+#### The Lightning friction: instances vs class names
+
+`auto_wrap_policy` takes **classes**, so it works great from YAML (a list of import paths). But `ignored_modules` / `ignored_states` take **instances** — the actual `nn.Module` / `nn.Parameter` objects from your built model. The `FSDPStrategy` is constructed **before** your `LightningModule` exists, so **you cannot set these from a YAML class list.** You need a hook that runs once the model is instantiated.
+
+`FSDPStrategy` forwards any unknown kwarg straight to `FullyShardedDataParallel` (see `_setup_model`), so the plumbing is there — you just have to supply the instances late. Two clean patterns:
+
+**Pattern A — subclass `FSDPStrategy` and resolve instances in `_setup_model`** (recommended; keeps auto-wrap for everything else):
+
+```python
+from lightning.pytorch.strategies import FSDPStrategy
+
+class FSDPStrategyWithIgnores(FSDPStrategy):
+    def _setup_model(self, model):
+        # `model` is the (unwrapped) LightningModule — instances exist now.
+        # Exclude a buffer-heavy / fp32-sensitive submodule from sharding.
+        self.kwargs["ignored_modules"] = [model.core_model.rotary_embedding]
+        return super()._setup_model(model)
+```
+
+Everything not listed is still auto-wrapped per your `auto_wrap_policy`; only the listed instances are left full and untouched.
+
+**Pattern B — build the FSDP wrap yourself in `LightningModule.configure_model`** (full manual control). Note: if you instead override the legacy `configure_sharded_model` hook, Lightning **skips** its own top-level wrap entirely (it assumes you wrapped everything), and any `auto_wrap_policy` you set is dropped with a warning. Use this only when you want to own the whole wrapping process.
+
+```python
+class MyModule(L.LightningModule):
+    def configure_model(self):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+        # Wrap the transformer trunk, but ignore the embedding table entirely.
+        self.core_model = FSDP(
+            self.core_model,
+            auto_wrap_policy=ModuleWrapPolicy({Block, GDNBlock}),
+            ignored_modules=[self.core_model.embedding],
+            use_orig_params=True,
+        )
+```
+
+#### When you actually want this
+
+- **Buffer-heavy submodules.** As §11 notes, FSDP's handling of registered buffers is fragile, and our codebase deliberately avoids buffers in some layers. If a submodule *must* carry persistent buffers (e.g. GDN convolution state, rotary caches), `ignored_modules` keeps it intact instead of letting FSDP mishandle it.
+- **Modules that must stay fp32** (numerically sensitive heads, some norms, loss modules) — ignoring them is cleaner than fighting the mixed-precision config.
+- **Frozen submodules** where sharding/communication is pure overhead with no memory payoff — e.g. a frozen embedding or a frozen vision encoder. (Gradients aren't reduced, which is exactly fine when `requires_grad=False`.)
+- **Small modules** where the per-collective launch overhead outweighs the tiny memory saved.
+
+#### Note on frozen vs ignored
+
+These are orthogonal. Setting `requires_grad=False` **freezes** a param but FSDP still **shards** it (you keep the memory win, and no gradient is produced so nothing is reduced). `ignored_modules` **un-shards** it (full copy per rank). Reach for `ignored_modules` only when you need the tensor kept whole — for plain freezing, just set `requires_grad=False` and leave it in the wrap.
+
+> ⚠️ With the default `use_orig_params=True`, mixing **trainable and frozen** params *inside the same FSDP unit* can fail flat-parameter construction in some PyTorch versions. If you hit that, either group frozen modules into their own wrap (separate FSDP unit) or ignore them outright.
+
 ---
 
 ## Section 6: Activation checkpointing policy
@@ -662,8 +741,8 @@ Common passthrough kwargs:
 | `limit_all_gathers` | `True` | Serialize all-gathers to reduce peak memory |
 | `sync_module_states` | `False` | Broadcast loaded weights from rank 0 on wrap |
 | `param_init_fn` | `None` | Custom meta → real materialization |
-| `ignored_modules` | `None` | Modules excluded from FSDP (stay on each rank in full) |
-| `ignored_states` | `None` | Finer-grained ignore (params/buffers) |
+| `ignored_modules` | `None` | Modules excluded from FSDP — params stay **full** on each rank, **not** sharded/reduced/cast. Needs instances, not classes. See §5. |
+| `ignored_states` | `None` | Newer unified form of `ignored_modules`; accepts params **or** modules. Only one of the two may be set. See §5. |
 | `process_group` | `None` | Custom process group (mutually exclusive with `device_mesh`) |
 | `device_mesh` | `None` | Device mesh for hybrid sharding |
 

@@ -200,104 +200,200 @@ So **smaller units → smaller max_i ψ_i → smaller peak memory**, but also mo
 
 ### 3.2.2 Hybrid Sharding: matching the cluster topology
 
-#### Why we need it (quick GPU topology refresher)
+This subsection answers one question: **if GPUs inside a server are fast but GPUs across servers are slow, how should we shard?**
 
-You flagged GPU topology as familiar -- here's the punchline.
+#### The problem in one sentence
 
-Modern GPU clusters are *hierarchical*:
+Full sharding (`F = W`, from §3.2.1) splits every parameter across *all* GPUs. That is great for memory, but it forces large AllGather/ReduceScatter collectives to cross slow inter-host links on every layer. Hybrid sharding keeps the big collectives **inside each host** and only uses the slow network for a much smaller sync step.
 
-```
-Single node (host):  8 GPUs connected via NVLink/NVSwitch.
-                     ~600 GB/s per GPU pair, low latency.
-
-Across nodes:        Connected by RoCE / InfiniBand.
-                     ~50-200 GB/s per node total, higher latency.
-                     The network is usually a "fat tree" -- multiple
-                     switch tiers with progressively higher fan-in,
-                     resulting in over-subscription at upper tiers.
-```
-
-The bandwidth ratio between intra-node and cross-node is often **10-30×**. Collectives that go across hosts are dramatically slower than the ones that stay within a host.
-
-Full sharding across the entire global world means every collective traverses cross-host links. Full replication does no parameter sharding at all (DDP, OOM for big models). Is there a middle ground that exploits the topology?
-
-#### The sharding factor F
-
-Define the **sharding factor `F`** as the number of ranks across which each parameter is sharded:
+#### Cluster topology (why this matters)
 
 ```
-F = 1                full replication (= DDP)
-F = W (world size)   full sharding   (everything goes cross-host)
-1 < F < W            hybrid sharding (the new sweet spot)
+Within one host (8 GPUs):     NVLink / NVSwitch, ~600 GB/s GPU↔GPU, low latency
+Across hosts:                 InfiniBand / RoCE, ~50–200 GB/s per node, higher latency
 ```
 
-For `1 < F < W`, the W ranks are organized into:
-- **W/F sharding groups** of size `F` each (parameters are sharded within these)
-- **F replication groups** of size `W/F` each (parameters are replicated across these)
+Intra-host bandwidth is often **10–30×** faster than cross-host. Any collective that spans all `W` ranks pays that penalty on every FSDP unit, every forward and backward pass.
+
+#### Three points on the sharding spectrum
+
+Recall **`F`** = number of ranks that jointly hold one sharded copy of the model (each rank stores `1/F` of each parameter).
+
+| Setting | Name | What each GPU stores | Cross-host traffic |
+|---|---|---|---|
+| `F = 1` | Full replication (DDP) | Full copy of all params | High (grad AllReduce every step) |
+| `F = G` (GPUs per host) | **Hybrid sharding** | `1/G` of params; full model replicated across hosts | Low |
+| `F = W` | Full sharding | `1/W` of params; no replication | High (AllGather + ReduceScatter every step) |
+
+Hybrid is the middle option: **shard within the fast island (one host), replicate across slow islands (hosts).**
 
 > 📌 Figure 4 in the paper (page 5) -- "Hybrid Sharding on 16 GPUs". Clip into `artifacts/figure_4_hybrid_sharding.png`.
 >
 > ![Figure 4](artifacts/figure_4_hybrid_sharding.png)
 
-The natural map: set `F = G` (GPUs per host). Then:
-- Sharding groups = each individual host's 8 GPUs (so AllGather/ReduceScatter stay on NVLink).
-- Replication groups = "same local rank across hosts" (rank 0 of every host forms one replication group, rank 1 of every host another, ...).
+#### Concrete example: 16 GPUs, 2 hosts, 8 GPUs each
 
-#### The gradient reduction trick
-
-The mathematical equivalence is the fun bit. Normal full-shard gradient reduction is one giant ReduceScatter over all W ranks:
+Take the paper's Figure 4 setup:
 
 ```
-g_global = Σ_{r=1..W} g_r       (then scatter to each rank's shard)
+W = 16 total GPUs
+G = 8 GPUs per host
+F = G = 8          ← shard within host, replicate across hosts
+
+Host 0:  GPU 0  GPU 1  GPU 2  GPU 3  GPU 4  GPU 5  GPU 6  GPU 7
+         └──────────────── one sharding group ────────────────────┘
+         Together these 8 GPUs hold ONE full copy of the model,
+         split 8 ways (each GPU owns 1/8 of every parameter).
+
+Host 1:  GPU 8  GPU 9  GPU 10 GPU 11 GPU 12 GPU 13 GPU 14 GPU 15
+         └──────────────── second sharding group ─────────────────┘
+         Together these 8 GPUs hold a SECOND full copy of the model,
+         also split 8 ways.
 ```
 
-Under hybrid sharding with `W/F` shard groups `S_1, ..., S_{W/F}`, you can decompose:
+**What lives on each GPU?** Pick one weight matrix `W` with 800 elements:
 
 ```
-g_global = Σ_{i=1..W/F} ( Σ_{r ∈ S_i} g_r )                    (Eq. 1 in paper)
-           ─────────────  ──────────────────
-           outer sum      inner sum
+Full sharding (F=16):  each of 16 GPUs stores 50 elements   (800/16)
+Hybrid (F=8):          each of 16 GPUs stores 100 elements  (800/8)
+Full replication:      each of 16 GPUs stores 800 elements
 ```
 
-The inner sum (`Σ_{r ∈ S_i} g_r`) is exactly what a **ReduceScatter within each sharding group** computes. After that, the outer sum is just summing one value per replication group -- exactly what an **AllReduce within each replication group** computes.
+In hybrid mode, **GPU 0 and GPU 8 store the same 100-element shard** (same slice of `W`). GPU 0 and GPU 1 store *different* shards that complement each other on Host 0.
 
-So hybrid sharding replaces:
+#### Two groupings of the same 16 GPUs
 
-```
-1 × global ReduceScatter  (slow, cross-host)
-```
-
-with:
+The same ranks participate in two different process groups, for two different jobs:
 
 ```
-1 × ReduceScatter within sharding group  (fast, intra-host)
-1 × AllReduce within replication group   (smaller, cross-host but smaller)
+SHARDING GROUPS (size F=8)          REPLICATION GROUPS (size W/F=2)
+"build one full model copy"         "sync the same shard across hosts"
+
+  Host 0: [0,1,2,3,4,5,6,7]            [0, 8]   ← both hold shard 0
+  Host 1: [8,9,10,11,12,13,14,15]      [1, 9]   ← both hold shard 1
+                                         [2,10]
+                                         ...
+                                         [7,15]
 ```
 
-#### The cross-host traffic math
+| Group type | Size | Members | Used for |
+|---|---|---|---|
+| **Sharding group** | `F` | All GPUs on one host | AllGather params; ReduceScatter grads — stays on NVLink |
+| **Replication group** | `W/F` | Same local GPU index on each host | AllReduce grads for one shard — crosses hosts, but small |
 
-The paper gives a clean comparison. For an `M`-element model, `W` ranks, `G` GPUs per host (so `F = G`, i.e. shard within host):
+**Rule of thumb:** set `F = G` so sharding groups = hosts. Replication groups = "GPU *k* on every host."
 
-| Strategy | Cross-host traffic per GPU per iteration |
+General formulas (for any valid `F` that divides `W`):
+
+```
+# of sharding groups   = W / F        (each has F ranks)
+# of replication groups = F           (each has W / F ranks)
+```
+
+#### What happens each training step (one FSDP unit)
+
+Trace one transformer block on Host 0, GPUs 0–7:
+
+**Forward**
+
+```
+1. AllGather within sharding group [0..7]     ← NVLink only
+   Each GPU had 1/8 of the params → now all 8 have the full unsharded copy.
+
+2. Run forward locally on each GPU's microbatch.
+
+3. Free the unsharded copy → back to 1/8 shards.
+```
+
+No cross-host traffic in forward. Host 1 does the same independently on GPUs 8–15.
+
+**Backward**
+
+```
+1. AllGather within sharding group [0..7]     ← NVLink only (reconstruct params)
+
+2. Run backward → each GPU computes gradients for its microbatch.
+
+3. ReduceScatter within sharding group [0..7] ← NVLink only
+   Sum gradients across the 8 GPUs on this host; each GPU keeps 1/8 of the result.
+
+4. AllReduce within replication group [0, 8]  ← cross-host (small)
+   GPU 0 and GPU 8 both own shard 0 — sum their partial gradients so both
+   replicas stay in sync. Repeat for [1,9], [2,10], … [7,15].
+```
+
+Step 3 handles **data-parallel reduction within a host** (different shards, different microbatches). Step 4 handles **replica sync across hosts** (same shard index, same logical parameter slice).
+
+Compare to full sharding, which would do one **global** AllGather and one **global** ReduceScatter over all 16 GPUs — both crossing the slow link twice per unit.
+
+#### Why the gradient math works (Eq. 1 in the paper)
+
+Full sharding ends backward with one global ReduceScatter: sum all `W` per-GPU gradients, then keep each rank's shard.
+
+Hybrid splits that sum into two stages that match the two groupings above. Name the two sharding groups `H₀` (Host 0) and `H₁` (Host 1):
+
+```
+global gradient  =  (sum of grads on H₀)  +  (sum of grads on H₁)
+                   ─────────────────────     ─────────────────────
+                   ReduceScatter on H₀        already done in step 3
+                   ReduceScatter on H₁
+
+                 =  replica₀_shard + replica₁_shard
+                   ───────────────────────────────
+                   AllReduce on replication groups (step 4)
+```
+
+So one slow global ReduceScatter becomes:
+
+```
+fast ReduceScatter within each host   (step 3)
+  +
+smaller AllReduce across hosts        (step 4, one shard at a time)
+```
+
+Same correct result; most bytes move on NVLink.
+
+#### Cross-host traffic (why hybrid wins on bandwidth)
+
+For a model with `M` total parameter elements, `W` GPUs, `G` GPUs per host, hybrid with `F = G`:
+
+| Strategy | Cross-host bytes per GPU per iteration (order of magnitude) |
 |---|---|
-| Full replication (DDP) | `2M(W-1)/W ≈ 2M` |
-| Full sharding | `3M(W-1)/W ≈ 3M` |
-| Hybrid sharding (`F=G`) | `2M(W-1)/(GW) ≈ 2M/G` |
+| Full replication (DDP) | `≈ 2M` — full gradient vectors cross the wire |
+| Full sharding (`F=W`) | `≈ 3M` — full params gathered *and* grads reduced globally |
+| Hybrid (`F=G`) | `≈ 2M/G` — only shard-sized gradient pieces cross the wire |
 
-That is, hybrid sharding does **roughly G× less cross-host traffic** than DDP, and ~1.5G× less than full sharding. For typical G=8, that's an 8× reduction.
+Exact formulas from the paper (page 6):
 
-This works because:
-- AllGather (forward) and AllGather (backward) -- the two biggest comm phases -- stay entirely within-host on NVLink. Cross-host links don't see them.
-- The cross-host AllReduce in the gradient phase operates on already-reduced gradients (after ReduceScatter), so the volume is much smaller.
+```
+DDP:    2M(W−1)/W  ≈ 2M
+Full:   3M(W−1)/W  ≈ 3M
+Hybrid: 2M(W−1)/(GW) ≈ 2M/G
+```
 
-#### When hybrid sharding is the right choice
+With `G = 8`, hybrid moves **~8× less** cross-host traffic than DDP and **~12× less** than full sharding. The win comes from:
 
-The paper articulates two motivations:
+1. **Forward/backward AllGathers never leave the host** — they are the largest messages.
+2. **Cross-host AllReduce sends only `1/F` of a gradient tensor** — already reduced within each host.
 
-1. **Medium-sized models that don't need full sharding's memory savings.** If a model fits with `F=W/2` but you don't have the memory headroom for full replication, hybrid is the right point on the curve.
-2. **Bandwidth-constrained clusters** -- when cross-host network is the bottleneck (common in commodity datacenters), hybrid recoups the locality.
+#### Memory vs bandwidth trade-off
 
-The flip side: hybrid sharding stores `W/F`× more parameters per rank than full sharding, so peak memory is higher. The whole point is that `F` is now a **tunable knob** the user can position on the memory-bandwidth Pareto curve.
+Hybrid stores **`W/F` times more parameters per GPU** than full sharding:
+
+```
+Full sharding (F=16):  Ψ/16  per rank
+Hybrid (F=8):          Ψ/8   per rank   ← 2× more param memory
+Full replication:      Ψ     per rank
+```
+
+You pay extra memory to buy back cross-host bandwidth. `F` is a **tunable knob** on the Pareto curve between "fit the biggest model" and "keep the network busy with compute, not collectives."
+
+#### When to choose hybrid
+
+1. **The model fits with `F = G` but not with full replication** — you need some sharding for memory, but not the maximum `F = W`.
+2. **Cross-host network is the bottleneck** — common in multi-node commodity clusters; hybrid keeps heavy collectives on NVLink.
+
+If the model is so large that even `Ψ/G` per GPU is too much, you need full sharding (`F = W`) and accept the cross-host cost — or add more nodes/GPUs.
 
 > **Paper ref:** "we can then compute the total cross-host traffic per GPU in the hybrid setup to be `2M(W-1)/(GW)`, a drastic reduction compared to full replication's `2M(W-1)/W` and full sharding's `3M(W-1)/W`." (page 6)
 
@@ -615,7 +711,7 @@ The lesson is operational: turn on the rate limiter only if you observe `cudaMal
 
 4. **Memory equation:** peak param memory per rank = `Ψ/F + max_i ψ_i` (sharded model + one unsharded unit). Tuned by wrapping granularity and sharding factor.
 
-5. **Hybrid sharding** maps `F = G` (GPUs per host) to keep AllGather/ReduceScatter on NVLink and use a smaller cross-host AllReduce. Cross-host traffic drops by ~G× vs DDP. Algebraically: `global ReduceScatter = within-group ReduceScatter + cross-group AllReduce`.
+5. **Hybrid sharding** (`F = G`): shard within each host (fast NVLink AllGather/ReduceScatter), replicate full model copies across hosts, sync with a smaller cross-host AllReduce on matching shard indices. Cross-host traffic ≈ `2M/G` vs ≈ `2M` (DDP) or ≈ `3M` (full sharding).
 
 6. **CUDA streams** are FIFO queues of GPU work. FSDP uses a separate stream for AllGathers to avoid the "false dependency on default-stream compute" that `ProcessGroupNCCL`'s default sync would otherwise create.
 

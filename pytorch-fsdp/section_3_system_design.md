@@ -68,7 +68,7 @@ m_i = \beta_1 m_i + (1-\beta_1) g_i, \quad
 v_i = \beta_2 v_i + (1-\beta_2) g_i^2
 $$
 
-There's no cross-element interaction (no matmul, no reduction across the parameter). So each rank can update **its own $1/F$ slice** of the FlatParameter completely independently, using only its $1/F$ slice of the gradient (which it already has after the backward ReduceScatter) and its $1/F$ slice of the moments. No AllGather is ever required for the optimizer step.
+There's no cross-element interaction (no matmul, no reduction across the parameter). So each rank can update **its own $1/F$ slice** of the unit's parameters completely independently, using only its $1/F$ slice of the gradient (which it already has after the backward ReduceScatter) and its $1/F$ slice of the moments. No AllGather is ever required for the optimizer step.
 
 ```mermaid
 flowchart LR
@@ -83,16 +83,16 @@ This is also *why the optimizer must be constructed **after** FSDP wraps the mod
 
 ### "Units need not be contiguous" vs. "materialize one at a time" — how both are true
 
-This pairing trips a lot of people up, so it's worth slowing down. The key is that **"one at a time" is at the granularity of the *unit*, not the individual layer.** A unit is whatever set of modules the wrap policy coalesced into a single FlatParameter, and FSDP gathers/frees that FlatParameter as one atomic block.
+This pairing trips a lot of people up, so it's worth slowing down. The key is that **"one at a time" is at the granularity of the *unit*, not the individual layer.** A unit is whatever set of modules the wrap policy groups together, and FSDP gathers/frees that whole group's parameters as one atomic block.
 
 So the two statements live at different levels:
 
 | Statement | What it's actually about |
 |---|---|
 | "A unit's modules need not be **contiguous**" | *Static* — which modules get grouped into a unit. The grouping doesn't have to follow execution order (Figure 1 puts `layer0` and `layer3` in the same unit). |
-| "FSDP materializes **one unit at a time**" | *Runtime* — at any instant, only one unit's FlatParameter is unsharded on the GPU. The whole unit is AllGathered together, used, then freed. |
+| "FSDP materializes **one unit at a time**" | *Runtime* — at any instant, only one unit's parameters are unsharded on the GPU. The whole unit is AllGathered together, used, then freed. |
 
-There's no contradiction: a non-contiguous unit is still **one** FlatParameter, gathered and freed as a unit. "Contiguity" refers to position in the *execution/declaration order* of modules, not to memory layout — inside the FlatParameter, the coalesced parameters are always physically contiguous (that's the whole flatten-concat-pad-chunk trick from §3.2.1).
+There's no contradiction: a non-contiguous unit's parameters are still gathered and freed as **one** atomic block. "Contiguity" here refers to position in the *execution/declaration order* of modules, not to memory layout — as we'll see in §3.2.1, FSDP coalesces all of a unit's parameters into a single physically-contiguous buffer regardless of where their modules sit in execution order.
 
 #### Is there a "planner"?
 
@@ -100,9 +100,9 @@ Not in the sense of a cost-model optimizer that searches for the best grouping. 
 
 ```mermaid
 flowchart TB
-    A["Wrap policy (user-defined)<br/>auto_wrap_policy or manual FSDP() wraps"] -->|"runs once, at construction"| B["Defines unit boundaries<br/>= which modules → which FlatParameter"]
+    A["Wrap policy (user-defined)<br/>auto_wrap_policy or manual FSDP() wraps"] -->|"runs once, at construction"| B["Defines unit boundaries<br/>= which modules are grouped into each unit"]
     C["Forward-order recording<br/>(§3.3.2)"] -->|"runs every iteration"| D["Observed execution order<br/>= when to AllGather / free each unit<br/>(reverse = backward prefetch order)"]
-    B --> E["At runtime: gather one unit's<br/>FlatParameter, compute, free,<br/>move to the next"]
+    B --> E["At runtime: gather one unit's<br/>parameters, compute, free,<br/>move to the next"]
     D --> E
 ```
 
@@ -112,7 +112,7 @@ flowchart TB
 
 #### Why people still wrap contiguously in practice
 
-Although the wrap policy *allows* non-contiguous units, it's usually a bad idea. The reason: **a unit's FlatParameter can't be freed until *every* layer in that unit has finished its forward.** It's gathered once and held — not re-gathered per layer.
+Although the wrap policy *allows* non-contiguous units, it's usually a bad idea. The reason: **a unit's gathered (unsharded) parameters can't be freed until *every* layer in that unit has finished its forward.** They're gathered once and held — not re-gathered per layer.
 
 Trace the exact Figure 1 grouping — unit0 = `{layer0, layer3}`, unit1 = `{layer1, layer2}`, unit2 = `{layer4, layer5}` — against the execution order `layer0 → layer1 → … → layer5`:
 

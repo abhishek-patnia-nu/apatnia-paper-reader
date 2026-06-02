@@ -43,7 +43,7 @@ In words: take a 6-layer model. Decompose into 3 "FSDP units" -- `[layer0, layer
    - Free the AllGathered parameters.
 
 $$
-\text{peak memory/rank} \;=\; \underbrace{\vphantom{\big|}\ \text{sharded model}\ }_{\text{always live}} \;+\; \underbrace{\vphantom{\big|}\ \text{largest single unit (unsharded)}\ }_{\text{live only during that unit's compute}}
+\text{peak memory/rank} \;=\; \underbrace{\text{sharded model}}_{\text{always live}} \;+\; \underbrace{\text{largest single unit (unsharded)}}_{\text{live only during that unit's compute}}
 $$
 
 That's the fundamental memory equation. Reducing peak comes down to either making the sharded portion smaller (more ranks) or making the largest unit smaller (finer-grained wrapping). The rest of §3 is about implementing this loop efficiently.
@@ -359,8 +359,8 @@ SHARDING GROUPS (size F=8)          REPLICATION GROUPS (size W/F=2)
 General formulas (for any valid $F$ that divides $W$):
 
 $$
-\#\,\text{sharding groups} = \frac{W}{F} \;\;(\text{each has } F \text{ ranks}), \qquad
-\#\,\text{replication groups} = F \;\;(\text{each has } W/F \text{ ranks})
+\text{number of sharding groups} = \frac{W}{F} \;\;(F \text{ ranks each}), \qquad
+\text{number of replication groups} = F \;\;(W/F \text{ ranks each})
 $$
 
 #### What happens each training step (one FSDP unit)

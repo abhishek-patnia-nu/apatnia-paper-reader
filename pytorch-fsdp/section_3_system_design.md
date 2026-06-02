@@ -42,17 +42,77 @@ In words: take a 6-layer model. Decompose into 3 "FSDP units" -- `[layer0, layer
    - ReduceScatter the gradients → each rank keeps its 1/N shard.
    - Free the AllGathered parameters.
 
-```
-Peak memory per rank:
-
-  sharded model       full unsharded copy of
-       +              the LARGEST single unit
-   (always live)      (live only during that unit's compute)
-```
+$$
+\text{peak memory/rank} \;=\; \underbrace{\vphantom{\big|}\ \text{sharded model}\ }_{\text{always live}} \;+\; \underbrace{\vphantom{\big|}\ \text{largest single unit (unsharded)}\ }_{\text{live only during that unit's compute}}
+$$
 
 That's the fundamental memory equation. Reducing peak comes down to either making the sharded portion smaller (more ranks) or making the largest unit smaller (finer-grained wrapping). The rest of §3 is about implementing this loop efficiently.
 
 > **Paper ref:** "FSDP only materializes unsharded parameters and gradients of one unit at a time, and otherwise, it keeps parameters and gradients sharded. Throughout the training loop, the optimizer states are kept sharded. The memory requirements for FSDP are proportional to the size of the sharded model plus the size of the largest fully-materialized FSDP unit." (page 4)
+
+### Why optimizer states are *never* materialized (unlike params/grads)
+
+You read this correctly: **params and grads get temporarily unsharded; optimizer states never do.** This isn't an oversight — optimizer states genuinely never need a full copy. The reason comes down to *what each piece of state is used for*:
+
+| State | When is the **full** (unsharded) tensor needed? | So FSDP… |
+|---|---|---|
+| **Parameters** | During forward/backward **compute** — a matmul needs the *whole* weight matrix, not 1/F of it. | AllGathers to unshard, computes, then frees. |
+| **Gradients** | Produced during backward over the full unsharded params, then immediately reduced. | Materialized transiently, then ReduceScattered back to 1/F. |
+| **Optimizer states** (Adam $m$, $v$, FP32 master copy) | **Never.** | Kept permanently sharded. |
+
+The key insight is that **`optimizer.step()` is element-wise.** Adam's update for each parameter element depends only on *that element's* gradient and *that element's* moments:
+
+$$
+\theta_i \leftarrow \theta_i - \text{lr}\cdot \frac{m_i}{\sqrt{v_i}+\epsilon}, \qquad
+m_i = \beta_1 m_i + (1-\beta_1) g_i, \quad
+v_i = \beta_2 v_i + (1-\beta_2) g_i^2
+$$
+
+There's no cross-element interaction (no matmul, no reduction across the parameter). So each rank can update **its own $1/F$ slice** of the FlatParameter completely independently, using only its $1/F$ slice of the gradient (which it already has after the backward ReduceScatter) and its $1/F$ slice of the moments. No AllGather is ever required for the optimizer step.
+
+```mermaid
+flowchart LR
+    A["sharded grad shard (1/F)<br/>from ReduceScatter"] --> C["optimizer.step()<br/>element-wise, local"]
+    B["sharded optimizer state (1/F)<br/>m, v, FP32 master copy"] --> C
+    C --> D["updated param shard (1/F)<br/>still sharded"]
+```
+
+This is also *why the optimizer must be constructed **after** FSDP wraps the model* — so it captures the sharded parameters and allocates its state at $1/F$ size. (See §4.1, Option A, which makes this explicit.) If you built the optimizer on the unsharded params, its state would be full-size and you'd lose the entire memory benefit.
+
+> **More on this later:** §4.4 (Native Mixed Precision) revisits this from the memory-accounting angle — the FP32 *master copy* of weights is part of the optimizer state and stays sharded at $\Psi/F$, while the transient unsharded unit only ever needs the low-precision (BF16) copy. That's what lets FSDP's mixed precision *decrease* peak memory instead of increasing it.
+
+### "Units need not be contiguous" vs. "materialize one at a time" — how both are true
+
+This pairing trips a lot of people up, so it's worth slowing down. The key is that **"one at a time" is at the granularity of the *unit*, not the individual layer.** A unit is whatever set of modules the wrap policy coalesced into a single FlatParameter, and FSDP gathers/frees that FlatParameter as one atomic block.
+
+So the two statements live at different levels:
+
+| Statement | What it's actually about |
+|---|---|
+| "A unit's modules need not be **contiguous**" | *Static* — which modules get grouped into a unit. The grouping doesn't have to follow execution order (Figure 1 puts `layer0` and `layer3` in the same unit). |
+| "FSDP materializes **one unit at a time**" | *Runtime* — at any instant, only one unit's FlatParameter is unsharded on the GPU. The whole unit is AllGathered together, used, then freed. |
+
+There's no contradiction: a non-contiguous unit is still **one** FlatParameter, gathered and freed as a unit. "Contiguity" refers to position in the *execution/declaration order* of modules, not to memory layout — inside the FlatParameter, the coalesced parameters are always physically contiguous (that's the whole flatten-concat-pad-chunk trick from §3.2.1).
+
+#### Is there a "planner"?
+
+Not in the sense of a cost-model optimizer that searches for the best grouping. FSDP's "planning" is just **two cooperating mechanisms**, neither of which is expensive:
+
+```mermaid
+flowchart TB
+    A["Wrap policy (user-defined)<br/>auto_wrap_policy or manual FSDP() wraps"] -->|"runs once, at construction"| B["Defines unit boundaries<br/>= which modules → which FlatParameter"]
+    C["Forward-order recording<br/>(§3.3.2)"] -->|"runs every iteration"| D["Observed execution order<br/>= when to AllGather / free each unit<br/>(reverse = backward prefetch order)"]
+    B --> E["At runtime: gather one unit's<br/>FlatParameter, compute, free,<br/>move to the next"]
+    D --> E
+```
+
+1. **The wrap policy decides the units (static).** This is the closest thing to a "planner," and it's deliberately simple — typically "make each `TransformerBlock` its own unit." It runs once when you wrap the model and never changes the boundaries afterward. (Details and the recursive "first match wins" assignment rule are in §4.1–4.2.)
+
+2. **The recorded execution order decides the schedule (dynamic).** FSDP doesn't statically plan *when* to gather each unit. Instead it records the actual forward execution order each iteration and replays it — using the *reverse* of that order as the backward prefetch order (§3.3.2). This is what makes "one unit at a time" land in the right sequence even for dynamic graphs.
+
+#### Why people still wrap contiguously in practice
+
+Although the wrap policy *allows* non-contiguous units, it's usually a bad idea. If a unit groups `layer0` and `layer3`, FSDP must keep that unit's unsharded FlatParameter **live from the moment `layer0` runs until `layer3` finishes** — spanning `layer1` and `layer2` in between. That widens the live window and inflates the $\max_i \psi_i$ term in the memory equation. Grouping *adjacent* layers (one unit per transformer block) keeps each unit's live window as short as possible, which is why that's the standard recipe.
 
 ---
 
@@ -180,21 +240,15 @@ This **flatten-concat-pad-chunk** algorithm has several nice properties:
 
 #### The memory-throughput trade-off
 
-Formally: for a model with `Ψ` total elements, split into N FlatParameters with sizes `ψ_1, ..., ψ_N` (so `Σ ψ_i = Ψ`), and sharding factor `F`:
+Formally: for a model with $\Psi$ total elements, split into $N$ FlatParameters with sizes $\psi_1, \dots, \psi_N$ (so $\sum_i \psi_i = \Psi$), and sharding factor $F$:
 
-```
-Peak parameter memory per rank:
-    Σ_i (ψ_i / F)        +        max_i ψ_i
-    ─────────────                ──────────
-    sharded model        unsharded copy of the
-    (always present)     CURRENT live unit
+$$
+\text{peak param memory/rank} \;=\; \underbrace{\sum_{i=1}^{N} \frac{\psi_i}{F}}_{\substack{\text{sharded model} \\ \text{(always present)}}} \;+\; \underbrace{\max_i \psi_i}_{\substack{\text{unsharded copy of} \\ \text{the current live unit}}} \;=\; \frac{\Psi}{F} \;+\; \max_i \psi_i
+$$
 
-    = Ψ/F + max_i ψ_i
-```
+Number of collectives per iteration: $O(N)$ — one AllGather per unit in forward, one AllGather + one ReduceScatter per unit in backward.
 
-Number of collectives per iteration: `O(N)` (one AllGather per unit in forward, one AllGather + one ReduceScatter per unit in backward).
-
-So **smaller units → smaller max_i ψ_i → smaller peak memory**, but also more collectives, more launch overhead, and worse comm efficiency. **Larger units → fewer, more efficient collectives**, but higher peak memory. The user controls this knob by deciding how to wrap modules into FSDP units -- typically one unit per transformer block is the sweet spot.
+So **smaller units → smaller $\max_i \psi_i$ → smaller peak memory**, but also more collectives, more launch overhead, and worse comm efficiency. **Larger units → fewer, more efficient collectives**, but higher peak memory. The user controls this knob by deciding how to wrap modules into FSDP units -- typically one unit per transformer block is the sweet spot.
 
 > **Paper ref:** "Finer-grained FlatParameter construction decreases peak memory but may decrease throughput by requiring more collectives." (page 5)
 
@@ -251,13 +305,15 @@ Host 1:  GPU 8  GPU 9  GPU 10 GPU 11 GPU 12 GPU 13 GPU 14 GPU 15
          also split 8 ways.
 ```
 
-**What lives on each GPU?** Pick one weight matrix `W` with 800 elements:
+**What lives on each GPU?** Pick one weight matrix $W$ with 800 elements:
 
-```
-Full sharding (F=16):  each of 16 GPUs stores 50 elements   (800/16)
-Hybrid (F=8):          each of 16 GPUs stores 100 elements  (800/8)
-Full replication:      each of 16 GPUs stores 800 elements
-```
+$$
+\begin{aligned}
+\text{Full sharding } (F=16): & \quad 800/16 = 50 \text{ elements per GPU} \\
+\text{Hybrid } (F=8): & \quad 800/8 = 100 \text{ elements per GPU} \\
+\text{Full replication } (F=1): & \quad 800 \text{ elements per GPU}
+\end{aligned}
+$$
 
 In hybrid mode, **GPU 0 and GPU 8 store the same 100-element shard** (same slice of `W`). GPU 0 and GPU 1 store *different* shards that complement each other on Host 0.
 
@@ -283,12 +339,12 @@ SHARDING GROUPS (size F=8)          REPLICATION GROUPS (size W/F=2)
 
 **Rule of thumb:** set `F = G` so sharding groups = hosts. Replication groups = "GPU *k* on every host."
 
-General formulas (for any valid `F` that divides `W`):
+General formulas (for any valid $F$ that divides $W$):
 
-```
-# of sharding groups   = W / F        (each has F ranks)
-# of replication groups = F           (each has W / F ranks)
-```
+$$
+\#\,\text{sharding groups} = \frac{W}{F} \;\;(\text{each has } F \text{ ranks}), \qquad
+\#\,\text{replication groups} = F \;\;(\text{each has } W/F \text{ ranks})
+$$
 
 #### What happens each training step (one FSDP unit)
 
@@ -363,30 +419,34 @@ For a model with `M` total parameter elements, `W` GPUs, `G` GPUs per host, hybr
 | Full sharding (`F=W`) | `≈ 3M` — full params gathered *and* grads reduced globally |
 | Hybrid (`F=G`) | `≈ 2M/G` — only shard-sized gradient pieces cross the wire |
 
-Exact formulas from the paper (page 6):
+Exact formulas from the paper (page 6), as cross-host bytes per GPU per iteration:
 
-```
-DDP:    2M(W−1)/W  ≈ 2M
-Full:   3M(W−1)/W  ≈ 3M
-Hybrid: 2M(W−1)/(GW) ≈ 2M/G
-```
+$$
+\begin{aligned}
+\text{DDP } (F=1): & \quad \frac{2M(W-1)}{W} && \approx\; 2M \\[4pt]
+\text{Full sharding } (F=W): & \quad \frac{3M(W-1)}{W} && \approx\; 3M \\[4pt]
+\text{Hybrid } (F=G): & \quad \frac{2M(W-1)}{GW} && \approx\; \frac{2M}{G}
+\end{aligned}
+$$
 
-With `G = 8`, hybrid moves **~8× less** cross-host traffic than DDP and **~12× less** than full sharding. The win comes from:
+With $G = 8$, hybrid moves **~8× less** cross-host traffic than DDP and **~12× less** than full sharding. The win comes from:
 
 1. **Forward/backward AllGathers never leave the host** — they are the largest messages.
 2. **Cross-host AllReduce sends only `1/F` of a gradient tensor** — already reduced within each host.
 
 #### Memory vs bandwidth trade-off
 
-Hybrid stores **`W/F` times more parameters per GPU** than full sharding:
+Hybrid stores **$W/F$ times more parameters per GPU** than full sharding:
 
-```
-Full sharding (F=16):  Ψ/16  per rank
-Hybrid (F=8):          Ψ/8   per rank   ← 2× more param memory
-Full replication:      Ψ     per rank
-```
+$$
+\begin{aligned}
+\text{Full sharding } (F=16): & \quad \Psi/16 \text{ per rank} \\
+\text{Hybrid } (F=8): & \quad \Psi/8 \text{ per rank} && (2\times \text{ more param memory}) \\
+\text{Full replication } (F=1): & \quad \Psi \text{ per rank}
+\end{aligned}
+$$
 
-You pay extra memory to buy back cross-host bandwidth. `F` is a **tunable knob** on the Pareto curve between "fit the biggest model" and "keep the network busy with compute, not collectives."
+You pay extra memory to buy back cross-host bandwidth. $F$ is a **tunable knob** on the Pareto curve between "fit the biggest model" and "keep the network busy with compute, not collectives."
 
 #### When to choose hybrid
 
@@ -709,9 +769,9 @@ The lesson is operational: turn on the rate limiter only if you observe `cudaMal
 
 3. **The FlatParameter** is the workhorse data structure. Flatten + concat + pad + chunk into F equal pieces. Maximally cooperates with NCCL's fast paths, minimizes per-collective overhead, and gives free gradient-layout consistency.
 
-4. **Memory equation:** peak param memory per rank = `Ψ/F + max_i ψ_i` (sharded model + one unsharded unit). Tuned by wrapping granularity and sharding factor.
+4. **Memory equation:** peak param memory per rank $= \Psi/F + \max_i \psi_i$ (sharded model + one unsharded unit). Tuned by wrapping granularity and sharding factor.
 
-5. **Hybrid sharding** (`F = G`): shard within each host (fast NVLink AllGather/ReduceScatter), replicate full model copies across hosts, sync with a smaller cross-host AllReduce on matching shard indices. Cross-host traffic ≈ `2M/G` vs ≈ `2M` (DDP) or ≈ `3M` (full sharding).
+5. **Hybrid sharding** ($F = G$): shard within each host (fast NVLink AllGather/ReduceScatter), replicate full model copies across hosts, sync with a smaller cross-host AllReduce on matching shard indices. Cross-host traffic $\approx 2M/G$ vs $\approx 2M$ (DDP) or $\approx 3M$ (full sharding).
 
 6. **CUDA streams** are FIFO queues of GPU work. FSDP uses a separate stream for AllGathers to avoid the "false dependency on default-stream compute" that `ProcessGroupNCCL`'s default sync would otherwise create.
 

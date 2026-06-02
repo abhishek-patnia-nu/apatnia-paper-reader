@@ -1,778 +1,491 @@
-# PyTorch Lightning `FSDPStrategy`: A Practical Deep Dive
+# FSDP in `aic-nuformer-research`: A Practical Guide
 
-A reference guide to Lightning's **Fully Sharded Data Parallel** strategy — what it is, how it plugs into `Trainer`, every knob you can turn, and how those knobs map to the underlying PyTorch `FullyShardedDataParallel` (FSDP) API.
+How **Fully Sharded Data Parallel** is actually wired in our stack — the `AICFSDPStrategy`
+subclass, the `configs/fsdp/` configs, the FSDP-units audit report, and how every knob maps to
+PyTorch's `FullyShardedDataParallel` (FSDP1). Grounded in the real code, not hypotheticals.
 
-This guide complements the [PyTorch FSDP paper notes](../../pytorch-fsdp/) (the systems paper on ZeRO-style sharding). That paper explains *why* parameter sharding exists; this guide explains *how Lightning wires it* so you can configure and debug real training runs without hand-rolling distributed code.
+This complements the [PyTorch FSDP paper notes](../../pytorch-fsdp/) (the *why* of ZeRO-style
+sharding). This guide is the *how we run it* reference.
 
-**Primary source of truth:** `lightning.pytorch.strategies.FSDPStrategy` (Lightning 2.x), which is a thin orchestration layer over `torch.distributed.fsdp.FullyShardedDataParallel`.
+**Sources of truth in the repo:**
 
-**Concrete examples in our stack:** `configs/qwen3_4b_fsdp.yaml` and `run_scripts/explore_gdn_fsdp.py` in `aic-nuformer-research`.
+| Concern | Where |
+|---|---|
+| Strategy | `src/aic_research/training/strategies/fsdp.py` — `AICFSDPStrategy` (+ units report) |
+| Precision | `src/aic_research/training/precision/nvfp4_mixed_precision.py` — `FSDPNVFP4MixedPrecision` |
+| Configs | `configs/fsdp/` — `base_bf16_mixed.yaml` + `fsdp_full_shard*.yaml` overrides |
+| LightningModule | `nuformer.training.transactions.ssm_core_lightning.SSMCoreLightningModule` |
+| Launch | `python src/aic_research/experiment_v2.py --config_file ...` |
+| Upstream | `lightning.pytorch.strategies.FSDPStrategy` → `torch.distributed.fsdp.FullyShardedDataParallel` |
+
+> **Version note.** We are on **torch 2.6 / FSDP1** (`FullyShardedDataParallel` with a flattened
+> `FlatParameter` per unit). This is *not* FSDP2 (`fully_shard` + DTensor). Everything below is
+> FSDP1 semantics.
 
 ---
 
 ## Table of contents
 
-1. [Where FSDPStrategy sits in the Lightning stack](#section-1-where-fsdpstrategy-sits-in-the-lightning-stack)
-2. [How to use it (Python, YAML, launch)](#section-2-how-to-use-it-python-yaml-launch)
-3. [Constructor arguments — the full inventory](#section-3-constructor-arguments--the-full-inventory)
-4. [Sharding strategies: what gets split where](#section-4-sharding-strategies-what-gets-split-where)
-5. [Auto-wrap policy: controlling FSDP granularity](#section-5-auto-wrap-policy-controlling-fsdp-granularity)
-   - [Excluding modules from FSDP (`ignored_modules` / `ignored_states`)](#excluding-modules-from-fsdp-ignored_modules--ignored_states)
-6. [Activation checkpointing policy](#section-6-activation-checkpointing-policy)
-7. [Mixed precision and `FSDPPrecision`](#section-7-mixed-precision-and-fsdpprecision)
-8. [Checkpointing: `state_dict_type`](#section-8-checkpointing-state_dict_type)
-9. [What Lightning does for you at runtime](#section-9-what-lightning-does-for-you-at-runtime)
-10. [Knobs you actually tune in practice](#section-10-knobs-you-actually-tune-in-practice)
-11. [Gotchas and failure modes](#section-11-gotchas-and-failure-modes)
-12. [Appendix: PyTorch FSDP kwargs passed through `**kwargs`](#appendix-pytorch-fsdp-kwargs-passed-through-kwargs)
+1. [Where the strategy sits](#section-1-where-the-strategy-sits)
+2. [How we run it (configs + launch)](#section-2-how-we-run-it-configs--launch)
+3. [`AICFSDPStrategy`: what we added on top](#section-3-aicfsdpstrategy-what-we-added-on-top)
+4. [The FSDP-units report (`fsdp_units.json`)](#section-4-the-fsdp-units-report-fsdp_unitsjson)
+5. [Sharding strategies](#section-5-sharding-strategies)
+6. [Auto-wrap policy: units & granularity](#section-6-auto-wrap-policy-units--granularity)
+7. [Excluding modules: `ignored_module_classes`](#section-7-excluding-modules-ignored_module_classes)
+8. [Activation checkpointing (and what the paper says)](#section-8-activation-checkpointing-and-what-the-paper-says)
+9. [Mixed precision: `FSDPPrecision` & NVFP4](#section-9-mixed-precision-fsdpprecision--nvfp4)
+10. [Gradient clipping & optimizer under FSDP](#section-10-gradient-clipping--optimizer-under-fsdp)
+11. [Checkpointing: `state_dict_type`](#section-11-checkpointing-state_dict_type)
+12. [Gotchas](#section-12-gotchas)
+13. [Appendix: passthrough FSDP kwargs](#appendix-passthrough-fsdp-kwargs)
 
 ---
 
-## Section 1: Where FSDPStrategy sits in the Lightning stack
+## Section 1: Where the strategy sits
 
-### The problem FSDP solves (30-second version)
+**DDP** replicates the full model, grads, and optimizer state on every GPU. Our 4B GDN model
+(`base_bf16_mixed.yaml`: `d_model=2560`, `n_layers=36`) in bf16-mixed AdamW would need on the order
+of ~16 bytes/param of training state — far past a single GPU at scale.
 
-Standard **DDP** replicates the full model, gradients, and optimizer state on every GPU. A 4B-parameter model in bf16-mixed AdamW training needs on the order of **~16 bytes per parameter** (weights + master copy + grad + Adam moments) — far more than one GPU can hold at scale.
+**FSDP (FULL_SHARD / ZeRO-3)** shards parameters, gradients, and optimizer state across the
+data-parallel group. Each rank stores a slice; before a unit's forward it **all-gathers** the full
+weight, and after backward it **reduce-scatters** gradients back to shards. Per-GPU memory drops
+roughly proportional to world size (modulo activations and comm buffers).
 
-**FSDP** (ZeRO-3 style) **shards** parameters, gradients, and optimizer states across the data-parallel group. Each rank only stores a slice. Before a layer runs forward, FSDP **all-gathers** the shards it needs into a temporary full weight; after backward, it **reduce-scatters** gradients back into shards. Peak memory drops roughly proportional to world size (modulo activations and communication buffers).
-
-### Strategy vs precision vs accelerator
-
-Lightning splits distributed concerns across three layers:
+Lightning splits the concern into three layers, and we subclass the middle one:
 
 ```mermaid
 flowchart TB
-    subgraph Trainer
-        A[Accelerator<br/>cuda / cpu / auto]
-        S[Strategy<br/>FSDPStrategy / DDPStrategy / ...]
-        P[Precision plugin<br/>FSDPPrecision / MixedPrecision]
-    end
-    A --> S
-    S --> P
-    P --> LM[LightningModule.forward]
+    A[Accelerator<br/>cuda / auto] --> S
+    S[Strategy<br/>**AICFSDPStrategy** : FSDPStrategy] --> P
+    P[Precision plugin<br/>FSDPPrecision / FSDPNVFP4MixedPrecision] --> LM[LightningModule.forward]
 ```
 
-| Component | Owns | FSDP-specific notes |
+| Component | Owns | Our specifics |
 |---|---|---|
-| **Accelerator** | Device type, moving tensors to GPU | FSDP still needs `accelerator="cuda"` (or `auto` with CUDA visible) |
-| **Strategy** (`FSDPStrategy`) | Process group, model wrapping, sharding, collectives, checkpoint I/O | Wraps your `LightningModule` in `FullyShardedDataParallel` |
-| **Precision plugin** (`FSDPPrecision`) | Autocast, grad scaler, dtype of inputs | **Required** companion for FSDP — plain `MixedPrecision` is rejected |
-
-When you write:
-
-```python
-trainer = L.Trainer(
-    strategy="fsdp",           # shorthand → FSDPStrategy()
-    precision="bf16-mixed",  # → FSDPPrecision("bf16-mixed")
-    devices=8,
-)
-```
-
-Lightning resolves the string `"fsdp"` via the strategy registry and pairs it with `FSDPPrecision` automatically. If you construct `FSDPStrategy(...)` explicitly, the precision plugin must still be `FSDPPrecision` (or omitted so Lightning injects one from `Trainer(precision=...)`).
-
-### Registered strategy aliases
-
-Lightning registers two string shortcuts:
-
-| String | Equivalent |
-|---|---|
-| `"fsdp"` | `FSDPStrategy()` with defaults |
-| `"fsdp_cpu_offload"` | `FSDPStrategy(cpu_offload=True)` |
-
-For anything non-default (custom wrap policy, hybrid sharding, sharded checkpoints), pass a full `FSDPStrategy(...)` object or a YAML `class_path` block (see §2).
+| **Accelerator** | Device type | `accelerator: auto` (CUDA) |
+| **Strategy** | Process group, model wrapping, sharding, collectives, checkpoint I/O | `AICFSDPStrategy` adds YAML `ignored_module_classes` + a units audit report |
+| **Precision** | Autocast, grad dtype | `FSDPPrecision` (required by FSDP); `FSDPNVFP4MixedPrecision` for FP4 |
 
 ---
 
-## Section 2: How to use it (Python, YAML, launch)
+## Section 2: How we run it (configs + launch)
 
-### Minimal Python
-
-```python
-import lightning as L
-from lightning.pytorch.strategies import FSDPStrategy
-
-strategy = FSDPStrategy(
-    sharding_strategy="FULL_SHARD",
-    auto_wrap_policy={MyTransformerBlock},  # set of module classes
-)
-
-trainer = L.Trainer(
-    accelerator="cuda",
-    devices=torch.cuda.device_count(),
-    strategy=strategy,
-    precision="bf16-mixed",
-)
-trainer.fit(model, train_dataloader)
-```
-
-### YAML via jsonargparse (our production pattern)
-
-In `aic-nuformer-research`, training configs declare the strategy as a subclass:
+Our FSDP configs are **layered**: a non-FSDP base (`base_bf16_mixed.yaml`, which defines the model /
+data / optimizer for the 4B GDN run) plus a thin FSDP override that swaps in `AICFSDPStrategy`.
 
 ```yaml
+# configs/fsdp/fsdp_full_shard.yaml  (override on top of base_bf16_mixed.yaml)
 trainer:
-  accelerator: auto
-  precision: bf16-mixed
-  num_nodes: 1
-  devices: auto
   strategy:
-    class_path: lightning.pytorch.strategies.FSDPStrategy
+    class_path: aic_research.training.strategies.fsdp.AICFSDPStrategy
     init_args:
       sharding_strategy: FULL_SHARD
       cpu_offload: false
-      auto_wrap_policy:
-        - nuformer.modules.block.Block
-        - aic_research.modules.gdn_block.GDNBlock
       activation_checkpointing_policy:
         - nuformer.modules.block.Block
-        - aic_research.modules.gdn_block.GDNBlock
+        - nuformer.modules.gdn_block.GDNBlock
+      auto_wrap_policy:
+        - nuformer.modules.block.Block
+        - nuformer.modules.gdn_block.GDNBlock
+      ignored_module_classes: []      # empty = shard everything
       state_dict_type: sharded
-  gradient_clip_val: 1.0
 ```
 
-jsonargparse resolves the class list under `auto_wrap_policy` into a `ModuleWrapPolicy` at instantiation time (Lightning helper `_auto_wrap_policy_kwargs`).
+The `configs/fsdp/` family:
 
-### Launch: you must spawn multiple processes
+| Config | What it is |
+|---|---|
+| `base_bf16_mixed.yaml` | 4B GDN model + data + Muon + `bf16-mixed`; **no** strategy (single-device base) |
+| `fsdp_full_shard.yaml` | FULL_SHARD, auto-wrap **and** activation checkpointing on `Block`/`GDNBlock` |
+| `fsdp_full_shard_no_act_ckpt.yaml` | Same, **activation checkpointing off**, `batch_size: 12` |
+| `fsdp_full_shard_act_ckpt.yaml` | A/B counterpart: checkpointing **on** at the same `batch_size: 12` |
+| `nvfp4_4b_wide_fused_glu.yaml` | NVFP4 baseline — **non-FSDP** (DDP), wide fat-GEMM arch |
 
-FSDP is a **multi-process** strategy. Single-process `python train.py` with `devices=2` works only because Lightning's launcher spawns workers — but the canonical, reliable pattern is:
+### Launch
+
+The entrypoint is `experiment_v2.py` (jsonargparse-driven), not `torchrun` directly. Stack the base
+and the override with repeated `--config_file`:
 
 ```bash
-torchrun --nproc_per_node=2 run_scripts/explore_gdn_fsdp.py \
-    --config configs/qwen3_4b_fsdp.yaml \
-    --max-steps 10
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python src/aic_research/experiment_v2.py \
+    --config_file configs/fsdp/base_bf16_mixed.yaml \
+    --config_file configs/fsdp/fsdp_full_shard_act_ckpt.yaml \
+    --run_name qwen3-4b-gdn-fsdp-fullshard-actCkpt-bf16mixed-$(date +%Y%m%d-%H%M%S) \
+    --local_run \
+    --compile
 ```
 
-Environment variables set by `torchrun` (`RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR`, `MASTER_PORT`) are consumed by Lightning's cluster environment. Do not mix manual `CUDA_VISIBLE_DEVICES` tricks with `devices=auto` without understanding rank-to-GPU mapping.
-
-### String shorthand vs explicit config
-
-| Approach | When to use |
-|---|---|
-| `strategy="fsdp"` | Quick experiments; defaults: `FULL_SHARD`, `state_dict_type="full"` (PyTorch Lightning) |
-| `FSDPStrategy(...)` / YAML `init_args` | Production: custom wrap policy, activation checkpointing, sharded checkpoints, hybrid sharding |
-| `configure_sharded_model` hook override | **Advanced / legacy:** you pre-wrap submodules yourself; Lightning skips the top-level FSDP wrap |
+- `--local_run` creates a fresh MLflow run locally (mutually exclusive with `--mlflow_run_id`). It is
+  **single-process**; for multi-GPU local runs pre-create the run and attach (see `experiment_v2.py`
+  module docstring).
+- `--compile` applies `torch.compile` to the inner model **before** FSDP wraps it.
 
 ---
 
-## Section 3: Constructor arguments — the full inventory
+## Section 3: `AICFSDPStrategy`: what we added on top
 
-`FSDPStrategy.__init__` signature (Lightning 2.x):
+`AICFSDPStrategy` (`src/aic_research/training/strategies/fsdp.py`) is a thin subclass of Lightning's
+`FSDPStrategy`. It exists because two things we want are awkward in stock Lightning:
 
-```python
-FSDPStrategy(
-    # --- ParallelStrategy / infrastructure (usually leave as None; Trainer fills in) ---
-    accelerator=None,
-    parallel_devices=None,
-    cluster_environment=None,
-    checkpoint_io=None,          # NOTE: FSDPStrategy does NOT use CheckpointIO
-    precision_plugin=None,       # must be FSDPPrecision if set explicitly
-
-    # --- Process group ---
-    process_group_backend=None,  # default: nccl on CUDA, gloo on CPU
-    timeout=None,                # default: 30 min process-group timeout
-
-    # --- Core FSDP configuration ---
-    cpu_offload=None,            # bool or torch.distributed.fsdp.CPUOffload
-    mixed_precision=None,        # torch.distributed.fsdp.MixedPrecision (rarely set directly)
-    auto_wrap_policy=None,       # set[Module subclass] | callable | ModuleWrapPolicy
-    activation_checkpointing=None,       # DEPRECATED — use activation_checkpointing_policy
-    activation_checkpointing_policy=None,
-    sharding_strategy="FULL_SHARD",
-    state_dict_type="full",      # "full" | "sharded"  (Fabric default: "sharded")
-    device_mesh=None,            # tuple (replicate, shard) or DeviceMesh; HYBRID_SHARD only
-
-    # --- Passed through to torch FSDP ---
-    **kwargs,
-)
-```
-
-Lightning also **forces** `use_orig_params=True` by default (unless you override in `**kwargs`). This is important — see §11.
-
-Below, each first-class argument is explained in depth.
-
-### `cpu_offload`
-
-**Type:** `bool | CPUOffload | None`  
-**Default:** `False` (no offload)
-
-When `True`, FSDP keeps parameter shards on CPU and copies them to GPU only for the layers about to compute. Trades **PCIe bandwidth and latency** for **GPU HBM**.
-
-Lightning normalizes a bare `bool` into:
+1. **`ignored_modules` from YAML.** Stock `auto_wrap_policy` takes *classes* (YAML-friendly), but
+   PyTorch's `ignored_modules` takes *instances* — which don't exist when the strategy is
+   constructed. We accept `ignored_module_classes` (dotted class paths) and resolve them to
+   instances inside `_setup_model`, where the model finally exists. See §7.
+2. **An audit of the resulting FSDP units.** After wrapping, we walk the unit tree and emit a report
+   (INFO + MLflow `fsdp_units.json`). See §4.
 
 ```python
-CPUOffload(offload_params=bool(cpu_offload))
+class AICFSDPStrategy(FSDPStrategy):
+    def _setup_model(self, model: nn.Module) -> nn.Module:
+        if self._ignored_module_classes:
+            ignored = _resolve_ignored_modules(model, self._ignored_module_classes)
+            if ignored:
+                self.kwargs["ignored_modules"] = ignored   # forwarded into FSDP(...)
+        model = super()._setup_model(model)                # <- the actual FSDP wrap
+        self._report_fsdp_units(model)                     # <- audit, fail-soft
+        return model
 ```
 
-For finer control (e.g. offload only parameters, not gradients), construct `CPUOffload` yourself:
-
-```python
-from torch.distributed.fsdp import CPUOffload
-
-FSDPStrategy(cpu_offload=CPUOffload(offload_params=True))
-```
-
-Use when: model fits in aggregate cluster memory but not per-GPU HBM. Avoid when: PCIe is the bottleneck (common on multi-node without fast links).
-
-### `mixed_precision` (strategy-level, not Trainer-level)
-
-**Type:** `torch.distributed.fsdp.MixedPrecision | None`  
-**Default:** `None` — Lightning derives it from `FSDPPrecision` (see §7)
-
-You *can* pass PyTorch's native `MixedPrecision(param_dtype=..., reduce_dtype=..., buffer_dtype=...)` directly to `FSDPStrategy`. In practice, almost everyone sets `Trainer(precision="bf16-mixed")` and lets `FSDPPrecision.mixed_precision_config` build the FSDP config.
-
-Direct override example (expert use):
-
-```python
-from torch.distributed.fsdp import MixedPrecision
-
-FSDPStrategy(
-    mixed_precision=MixedPrecision(
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,   # all-reduce grads in fp32
-        buffer_dtype=torch.bfloat16,
-    ),
-)
-```
-
-### `auto_wrap_policy`
-
-**Type:** `set[type[nn.Module]] | Callable | ModuleWrapPolicy | None`  
-**Default:** `None` → FSDP wraps only the **root** `LightningModule` as one giant FSDP instance
-
-This is the **single most important tuning knob** for memory and performance. See §5.
-
-Lightning convenience: pass a **set or list of module classes** (YAML list of import paths) and it becomes `ModuleWrapPolicy({Block, GDNBlock, ...})`.
-
-### `activation_checkpointing` / `activation_checkpointing_policy`
-
-**Type:** same shapes as `auto_wrap_policy`  
-**Default:** `None` (no activation checkpointing)
-
-Selects **which submodules** get wrapped with PyTorch's activation checkpointing *after* FSDP wrapping. Independent of the wrap policy — you often want the same class list for both (as in `qwen3_4b_fsdp.yaml`). See §6.
-
-### `sharding_strategy`
-
-**Type:** `"FULL_SHARD" | "SHARD_GRAD_OP" | "NO_SHARD" | "HYBRID_SHARD" | ShardingStrategy`  
-**Default:** `"FULL_SHARD"`
-
-Controls **what** is sharded across ranks. See §4.
-
-### `device_mesh`
-
-**Type:** `tuple[int, int] | DeviceMesh | None`  
-**Default:** `None`  
-**Requires:** `sharding_strategy="HYBRID_SHARD"` (or enum equivalent), PyTorch ≥ 2.2
-
-Tuple `(replication_size, sharding_size)` where `replication_size * sharding_size == world_size`.
-
-Example — 8 GPUs, hybrid shard within node, replicate across 2 nodes:
-
-```python
-# 4-way shard inside node, 2-way replicate across nodes → (2, 4), world_size=8
-FSDPStrategy(
-    sharding_strategy="HYBRID_SHARD",
-    device_mesh=(2, 4),
-    auto_wrap_policy={TransformerBlock},
-)
-```
-
-Lightning converts a tuple to `init_device_mesh("cuda", (2, 4))` during setup.
-
-### `state_dict_type`
-
-**Type:** `"full" | "sharded"`  
-**Default:** `"full"` in PyTorch Lightning Trainer; our YAML uses `"sharded"`
-
-Controls checkpoint format on save/load. See §8.
-
-### `process_group_backend` and `timeout`
-
-- **`process_group_backend`:** `"nccl"` (GPU), `"gloo"` (CPU fallback), or custom. Default inferred from root device.
-- **`timeout`:** `datetime.timedelta` for distributed init / collectives. Default 30 minutes. Increase if slow filesystem checkpoint loads cause NCCL timeouts during resume.
-
-### Infrastructure args (rarely touch directly)
-
-| Arg | Purpose |
-|---|---|
-| `accelerator` | Wired by `Trainer` |
-| `parallel_devices` | List of `torch.device` per local rank |
-| `cluster_environment` | SLURM, torchrun env parsing |
-| `checkpoint_io` | **Unsupported** — `FSDPStrategy` raises if you set a custom CheckpointIO |
-| `precision_plugin` | Must be `FSDPPrecision`; otherwise `TypeError` |
+Everything else (sharding, precision, checkpoint I/O) is inherited unchanged. The report path is
+wrapped in a fail-soft `try/except` — introspection must never break training.
 
 ---
 
-## Section 4: Sharding strategies: what gets split where
+## Section 4: The FSDP-units report (`fsdp_units.json`)
 
-PyTorch's `ShardingStrategy` enum (string names accepted by Lightning):
+A **unit** (FSDP-paper terminology) is the granularity of sharding/communication: the wrap policy
+groups a unit's parameters into one `FlatParameter`, all-gathered before that unit's
+forward/backward and freed after. The **root** unit owns the residual params not claimed by any
+nested unit (embeddings / final norm / `lm_head`).
+
+`build_fsdp_units_report(model, ...)` enumerates units via
+`FullyShardedDataParallel.fsdp_modules(model)` and reads each unit's `FlatParameter` metadata. It's
+pure (torch only) and CPU unit-tested (`tests/test_fsdp_report.py`); the INFO/MLflow logging is
+`log_fsdp_units_report` (rank-0 only, idempotent on resume, fail-soft) — mirroring the NVFP4
+`swap_linears_to_nvfp4` / `log_convert_report` split.
+
+Schema (artifact `fsdp_units.json`):
+
+```jsonc
+{
+  "strategy": { "class": "AICFSDPStrategy", "sharding_strategy": "FULL_SHARD",
+                "world_size": 8, "auto_wrap_policy": [...], "ignored_module_classes": [] },
+  "totals":   { "num_units": 37, "num_param_units": 37, "total_params": 4026548224,
+                "rank0_sharded_params": 503318528, "ignored_modules": 0 },
+  "units":    [ { "index": 0, "module_fqn": "", "wrapped_class": "Qwen3GDNModel",
+                  "is_root": true, "num_orig_params": 3, "unsharded_numel": 134234112,
+                  "rank0_sharded_numel": 16779264, "dtype": "torch.float32",
+                  "param_fqns": ["embeddings.weight", "output_norm.weight", "lm_head.weight"] },
+                /* one entry per Block / GDNBlock unit ... */ ],
+  "ignored":  [ /* {module_fqn, class, numel} per ignored module */ ]
+}
+```
+
+Use it to: verify the unit decomposition matches your wrap policy, see what the root holds, confirm
+`ignored_module_classes` took effect, and read **rank-0 shard sizes** (only the last rank differs by
+padding, so rank-0 is representative without any cross-rank comm). It also exposes weight tying —
+under tied embeddings the shared weight appears in exactly one unit's `param_fqns`.
+
+---
+
+## Section 5: Sharding strategies
 
 ```mermaid
 flowchart LR
     subgraph FULL_SHARD["FULL_SHARD (ZeRO-3)"]
-        P1[Params sharded]
-        G1[Grads sharded]
-        O1[Optimizer sharded]
+      a[Params sharded] & b[Grads sharded] & c[Optim sharded]
     end
     subgraph SHARD_GRAD_OP["SHARD_GRAD_OP (ZeRO-2)"]
-        P2[Params replicated]
-        G2[Grads sharded]
-        O2[Optimizer sharded]
+      d[Params replicated] & e[Grads sharded] & f[Optim sharded]
     end
     subgraph NO_SHARD["NO_SHARD"]
-        P3[Params replicated]
-        G3[Grads replicated]
-        O3[Optimizer replicated]
+      g[Params replicated] & h[Grads replicated] & i[Optim replicated]
     end
 ```
 
-| Strategy | Params | Grads | Optimizer | Memory vs DDP | Comm pattern |
-|---|---|---|---|---|---|
-| **FULL_SHARD** | Sharded | Sharded | Sharded | Lowest per-GPU memory | All-gather before forward; reduce-scatter on backward |
-| **SHARD_GRAD_OP** | Replicated | Sharded | Sharded | Medium | Like DDP for params; sharded grad reduce |
-| **NO_SHARD** | Replicated | Replicated | Replicated | Same as DDP | Standard DDP all-reduce |
-| **HYBRID_SHARD** | Sharded within node; replicated across nodes | Sharded within node | Sharded within node | Good for multi-node | Intra-node all-gather; inter-node replication |
-
-**When to pick which:**
-
-- **FULL_SHARD** — default for large LM training (our `qwen3_4b_fsdp.yaml`). Maximizes model-size headroom.
-- **SHARD_GRAD_OP** — when all-gather overhead dominates and the model *barely* fits replicated params per GPU.
-- **NO_SHARD** — debugging ("is FSDP the bug?") or tiny models.
-- **HYBRID_SHARD** — multi-node jobs where full cross-node all-gather is too expensive; requires `device_mesh` or explicit `process_group`.
+| Strategy | Params | Grads | Optim | Use |
+|---|---|---|---|---|
+| **FULL_SHARD** | sharded | sharded | sharded | our default — max model-size headroom |
+| **SHARD_GRAD_OP** | replicated | sharded | sharded | when all-gather overhead dominates and params fit replicated |
+| **NO_SHARD** | replicated | replicated | replicated | debugging ("is FSDP the bug?") / tiny models |
+| **HYBRID_SHARD** | shard intra-node, replicate inter-node | intra-node | intra-node | multi-node when full cross-node all-gather is too costly (needs `device_mesh`) |
 
 ---
 
-## Section 5: Auto-wrap policy: controlling FSDP granularity
+## Section 6: Auto-wrap policy: units & granularity
 
-### Why wrapping matters
+Communication happens at unit boundaries, so wrapping granularity is the dominant memory/comms lever.
 
-FSDP operates on **FSDP instances** — each instance owns a contiguous subtree of the model. Communication (all-gather / reduce-scatter) happens at FSDP boundaries.
-
-| Granularity | Memory | Communication overhead | Typical use |
+| Granularity | Peak memory | Collectives | Use |
 |---|---|---|---|
-| **Root only** (default, no policy) | Highest peak activations (whole model unshard at once) | Lowest number of collectives | Small models / debugging |
-| **One FSDP unit per transformer block** | Lower peak — only one block's params gathered at a time | One all-gather per block per forward | **Standard for LLMs** |
-| **Sub-block (attention vs MLP separate)** | Even lower peak | More collectives | Huge models, memory-bound |
+| Root only (no policy) | highest (whole model unsharded at once) | fewest | tiny models / debug |
+| **One unit per transformer block** | low (one block gathered at a time) | one all-gather/block/forward | **our default** |
+| Sub-block (attn vs MLP) | lowest | most | extreme memory pressure |
 
-Our config wraps **each** `Block` and `GDNBlock`:
+Our configs wrap each `Block` and `GDNBlock`:
 
 ```yaml
 auto_wrap_policy:
   - nuformer.modules.block.Block
-  - aic_research.modules.gdn_block.GDNBlock
+  - nuformer.modules.gdn_block.GDNBlock
 ```
 
-So a 36-layer hybrid model becomes ~36 FSDP leaves (+ embedding/head/root wrappers depending on module tree).
+So the 36-layer hybrid becomes ~36 block units + a root unit (verify the exact count in
+`fsdp_units.json`). Lightning turns a YAML class list into a `ModuleWrapPolicy` via
+`_auto_wrap_policy_kwargs`.
 
-### Accepted policy forms
+**What PyTorch supports (and what it doesn't).** FSDP1 wrapping is **instance-based**, never
+name-based — the policy callback receives an `nn.Module`, never an FQN. Upstream `torch.distributed.
+fsdp.wrap` offers: `ModuleWrapPolicy` / `transformer_auto_wrap_policy` (class-based),
+`size_based_auto_wrap_policy` (numel threshold), `CustomPolicy` / `lambda_auto_wrap_policy`
+(arbitrary instance predicate — and `CustomPolicy` can return a per-unit kwargs dict to vary e.g.
+`sharding_strategy`), and `_or_policy` to combine. There is **no built-in name/regex policy**; to
+target by name you resolve names→instances yourself and feed a `CustomPolicy`. Lightning passes any
+`_Policy`/callable straight through, so you can inject these from YAML via `class_path` without
+touching `AICFSDPStrategy`.
 
-1. **Set/list of module classes** (recommended in YAML):
-
-   ```python
-   FSDPStrategy(auto_wrap_policy={TransformerBlock, nn.Linear})
-   ```
-
-   Lightning → `ModuleWrapPolicy({TransformerBlock, nn.Linear})`.
-
-2. **`ModuleWrapPolicy` directly** (Python):
-
-   ```python
-   from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-   FSDPStrategy(auto_wrap_policy=ModuleWrapPolicy({Block}))
-   ```
-
-3. **Custom callable** `(module, recurse, nonwrapped_numel) -> bool` — full control; use when class-based policy is too coarse.
-
-4. **Size-based policies** via `**kwargs` (see Appendix): `size_based_auto_wrap_policy` with `min_num_params=...`.
-
-### What happens at setup
-
-In `FSDPStrategy._setup_model`:
-
-```python
-model = FullyShardedDataParallel(
-    module=model,
-    cpu_offload=self.cpu_offload,
-    mixed_precision=self.mixed_precision_config,
-    sharding_strategy=self.sharding_strategy,
-    device_id=self.root_device.index,
-    auto_wrap_policy=...,  # from kwargs
-    use_orig_params=True,  # Lightning default
-)
-```
-
-If **you already wrapped** submodules in `configure_sharded_model`, Lightning detects existing FSDP modules and **drops** `auto_wrap_policy` with a warning.
-
-### Tuning guidance
-
-- **Start** with one wrap per transformer block (matches our YAML).
-- If a **specific block type misbehaves** (stateful/recurrent layers, custom buffers — e.g. GDN conv state), try **removing that class** from the policy so it stays inside a parent FSDP unit, or isolate it under `NO_SHARD` via custom policy.
-- If **OOM persists**, combine finer wrapping with `activation_checkpointing_policy` (§6).
-- If **step time is communication-bound**, coarsen wrapping (fewer FSDP units).
-
-### Excluding modules from FSDP (`ignored_modules` / `ignored_states`)
-
-A frequent need: *"I want FSDP for most of the model, but module X should be left alone."* There are two **very different** ways to "exclude" a module, and confusing them is a common source of bugs.
-
-#### Critical distinction: "not wrapped" ≠ "not sharded"
-
-| Lever | Mechanism | Are the module's params still **sharded**? | Are gradients still **reduced** across ranks? |
-|---|---|---|---|
-| **Omit class from `auto_wrap_policy`** | Module is folded into its nearest enclosing FSDP unit | **Yes** — its params join the parent unit's FlatParameter and are sharded | Yes (by the parent unit) |
-| **Custom callable returns `False`** for the subtree | Same as above | **Yes** | Yes |
-| **`ignored_modules=[mod]`** | Module is fully excluded from this FSDP instance | **No** — full unsharded params live on every rank | **No** — FSDP does not touch them |
-| **`ignored_states=[param_or_buffer]`** | Specific params/buffers excluded (finer-grained) | **No** for those tensors | **No** |
-
-The trap: **removing a class from the wrap policy does not stop its parameters from being sharded.** It only changes *granularity* — the params get absorbed into the parent FSDP unit's flat parameter and are still split across ranks. If you genuinely want FSDP to leave a module untouched (full replica on every rank, no all-gather, no reduce-scatter, no mixed-precision cast), you need `ignored_modules` or `ignored_states`.
-
-> From the PyTorch docstring: `ignored_modules` exists "to avoid sharding specific parameters at module granularity" — i.e. the params stay full even though everything around them is sharded.
-
-#### What `ignored_modules` actually does
-
-When you pass `ignored_modules=[some_submodule]`:
-
-- The submodule's **own parameters and all its descendants' parameters and buffers** are excluded from this FSDP instance.
-- Those tensors are **not flattened, not sharded, not all-gathered, not reduce-scattered.** Each rank keeps the full tensor.
-- FSDP's **mixed precision does not cast them** — they keep whatever dtype they were initialized in. (This is the canonical way to force a submodule to stay fp32 while the rest runs bf16.)
-- **FSDP does not reduce their gradients.** ⚠️ If those params are trainable and replicated across data-parallel ranks, the ranks will **diverge** unless you sync them yourself (wrap that submodule in `DDP`, or manually all-reduce its grads). For a frozen / eval-only submodule this is a non-issue.
-
-`ignored_states` is the newer, unified form. It accepts **either** an iterable of parameters **or** an iterable of modules, with the same semantics. You may set **only one** of `ignored_modules` / `ignored_states` — passing both raises.
-
-#### The Lightning friction: instances vs class names
-
-`auto_wrap_policy` takes **classes**, so it works great from YAML (a list of import paths). But `ignored_modules` / `ignored_states` take **instances** — the actual `nn.Module` / `nn.Parameter` objects from your built model. The `FSDPStrategy` is constructed **before** your `LightningModule` exists, so **you cannot set these from a YAML class list.** You need a hook that runs once the model is instantiated.
-
-`FSDPStrategy` forwards any unknown kwarg straight to `FullyShardedDataParallel` (see `_setup_model`), so the plumbing is there — you just have to supply the instances late. Two clean patterns:
-
-**Pattern A — subclass `FSDPStrategy` and resolve instances in `_setup_model`** (recommended; keeps auto-wrap for everything else):
-
-```python
-from lightning.pytorch.strategies import FSDPStrategy
-
-class FSDPStrategyWithIgnores(FSDPStrategy):
-    def _setup_model(self, model):
-        # `model` is the (unwrapped) LightningModule — instances exist now.
-        # Exclude a buffer-heavy / fp32-sensitive submodule from sharding.
-        self.kwargs["ignored_modules"] = [model.core_model.rotary_embedding]
-        return super()._setup_model(model)
-```
-
-Everything not listed is still auto-wrapped per your `auto_wrap_policy`; only the listed instances are left full and untouched.
-
-**Pattern B — build the FSDP wrap yourself in `LightningModule.configure_model`** (full manual control). Note: if you instead override the legacy `configure_sharded_model` hook, Lightning **skips** its own top-level wrap entirely (it assumes you wrapped everything), and any `auto_wrap_policy` you set is dropped with a warning. Use this only when you want to own the whole wrapping process.
-
-```python
-class MyModule(L.LightningModule):
-    def configure_model(self):
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp.wrap import ModuleWrapPolicy
-        # Wrap the transformer trunk, but ignore the embedding table entirely.
-        self.core_model = FSDP(
-            self.core_model,
-            auto_wrap_policy=ModuleWrapPolicy({Block, GDNBlock}),
-            ignored_modules=[self.core_model.embedding],
-            use_orig_params=True,
-        )
-```
-
-#### When you actually want this
-
-- **Buffer-heavy submodules.** As §11 notes, FSDP's handling of registered buffers is fragile, and our codebase deliberately avoids buffers in some layers. If a submodule *must* carry persistent buffers (e.g. GDN convolution state, rotary caches), `ignored_modules` keeps it intact instead of letting FSDP mishandle it.
-- **Modules that must stay fp32** (numerically sensitive heads, some norms, loss modules) — ignoring them is cleaner than fighting the mixed-precision config.
-- **Frozen submodules** where sharding/communication is pure overhead with no memory payoff — e.g. a frozen embedding or a frozen vision encoder. (Gradients aren't reduced, which is exactly fine when `requires_grad=False`.)
-- **Small modules** where the per-collective launch overhead outweighs the tiny memory saved.
-
-#### Note on frozen vs ignored
-
-These are orthogonal. Setting `requires_grad=False` **freezes** a param but FSDP still **shards** it (you keep the memory win, and no gradient is produced so nothing is reduced). `ignored_modules` **un-shards** it (full copy per rank). Reach for `ignored_modules` only when you need the tensor kept whole — for plain freezing, just set `requires_grad=False` and leave it in the wrap.
-
-> ⚠️ With the default `use_orig_params=True`, mixing **trainable and frozen** params *inside the same FSDP unit* can fail flat-parameter construction in some PyTorch versions. If you hit that, either group frozen modules into their own wrap (separate FSDP unit) or ignore them outright.
+Tuning: start at one-unit-per-block; if a stateful layer misbehaves under flat-param sharding,
+remove its class (folds into the parent unit) or exclude it (§7); coarsen if comms-bound, add
+activation checkpointing (§8) if still OOM.
 
 ---
 
-## Section 6: Activation checkpointing policy
+## Section 7: Excluding modules: `ignored_module_classes`
 
-Separate from **weight sharding**, activation checkpointing trades **compute for memory** by not storing intermediate activations — they are recomputed in backward.
+### "not wrapped" ≠ "not sharded"
 
-Lightning applies checkpointing **after** FSDP wrap via `apply_activation_checkpointing`:
+| Lever | Mechanism | Still sharded? | Grads reduced? |
+|---|---|---|---|
+| Omit class from `auto_wrap_policy` | folds into parent unit's FlatParameter | **Yes** | Yes (by parent) |
+| `ignored_module_classes` → `ignored_modules=[...]` | fully excluded from the FSDP instance | **No** — full unsharded copy per rank | **No** |
+
+The trap: removing a class from the wrap policy only changes **granularity** — params still shard
+into the parent unit. To leave a module genuinely untouched (full replica, no all-gather/
+reduce-scatter, **no mixed-precision cast**) you need `ignored_modules`.
+
+### Our YAML-native path (the real code — not a hypothetical)
+
+`AICFSDPStrategy` accepts dotted class paths and resolves them to instances at wrap time:
+
+```yaml
+trainer:
+  strategy:
+    class_path: aic_research.training.strategies.fsdp.AICFSDPStrategy
+    init_args:
+      auto_wrap_policy: [nuformer.modules.block.Block, nuformer.modules.gdn_block.GDNBlock]
+      ignored_module_classes:
+        - nuformer.modules.gdn_block.GDNBlock     # e.g. keep GDN conv-state full/fp32
+```
+
+Semantics of an ignored module (also documented in `fsdp.py`):
+
+- Its params/buffers (and descendants') stay **full and unsharded** on every rank.
+- FSDP **does not cast** them via mixed precision (canonical way to keep a submodule fp32).
+- FSDP **does not reduce their gradients**. ⚠️ A *trainable* ignored module diverges across ranks
+  unless you sync it yourself. Fine for frozen/eval-only submodules.
+
+When to reach for it: buffer-heavy or numerically sensitive submodules that misbehave under
+flat-parameter sharding (e.g. GDN conv state, rotary caches), modules that must stay fp32, or frozen
+submodules where sharding is pure overhead. **Frozen ≠ ignored:** `requires_grad=False` still
+*shards* (keeps the memory win); use `ignored_module_classes` only when the tensor must stay whole.
+The `ignored` section of `fsdp_units.json` confirms what was excluded.
+
+---
+
+## Section 8: Activation checkpointing (and what the paper says)
+
+Separate from **weight sharding**, activation checkpointing trades **compute for memory**: a wrapped
+unit's intermediate activations are dropped after forward and **recomputed** during backward.
+
+### What the PyTorch FSDP paper says about it
+
+**Almost nothing — and that's the point.** Activation (gradient) checkpointing is *not* a
+contribution of the FSDP paper; it's treated as an **orthogonal, composable** technique. It surfaces
+only in two correctness contexts:
+
+- **§3 (system design):** "multiple forwards before a backward — e.g. activation checkpointing — …
+  autograd handles it naturally." Recomputation re-runs a unit's forward in backward, so a unit can
+  be forwarded more than once per step.
+- **§4 (implementation):** FSDP schedules its AllGather/ReduceScatter via **standard autograd
+  hooks**, so "gradient checkpointing, double-backward, retain_graph, etc." work for free — autograd
+  drives the hook firing.
+
+So the paper's stance: checkpointing reduces **activation** memory while FSDP reduces
+**param/grad/optimizer** memory, and FSDP was built on autograd hooks specifically so the extra
+recompute forward doesn't break its comm scheduling. There is no dedicated algorithm or benchmark
+for it in the paper.
+
+### How Lightning applies it
+
+`_setup_activation_checkpointing` (`lightning/fabric/strategies/fsdp.py`) runs **after** the FSDP
+wrap and calls PyTorch's `apply_activation_checkpointing` with a `CheckpointWrapper`:
 
 ```python
-# Simplified from lightning/fabric/strategies/fsdp.py
+# torch >= 2.2 (we are on 2.6): default checkpoint_wrapper → non-reentrant (CheckpointImpl.NO_REENTRANT)
 apply_activation_checkpointing(
     module,
     checkpoint_wrapper_fn=checkpoint_wrapper,
-    auto_wrap_policy=ModuleWrapPolicy({Block, GDNBlock}),  # from policy
+    auto_wrap_policy=ModuleWrapPolicy({Block, GDNBlock}),   # from activation_checkpointing_policy
 )
 ```
 
-When you pass a **class set** as `activation_checkpointing_policy`, Lightning reuses the same `ModuleWrapPolicy` machinery as `auto_wrap_policy`.
-
-### Interaction with FSDP
-
 | Concern | Behavior |
 |---|---|
-| Order of operations | FSDP wrap first, then activation checkpointing wrap |
-| Reentrant checkpointing | PyTorch ≥ 2.2 uses default reentrant behavior; older versions force `NO_REENTRANT` |
-| Already-checkpointed model | Warning + skip if `CheckpointWrapper` already present |
-| `--no-activation-checkpoint` | Our explorer script pops `activation_checkpointing_policy` from YAML for A/B tests |
+| Order | FSDP wrap first, then checkpoint wrap |
+| Reentrancy | torch ≥ 2.2 → **non-reentrant** (the modern default) |
+| Already checkpointed | warns and **skips** if a `CheckpointWrapper` is already present |
+| Policy form | same class-set machinery as `auto_wrap_policy` |
 
-Typical LLM recipe: **same classes** in both `auto_wrap_policy` and `activation_checkpointing_policy` — checkpoint every block that is also an FSDP leaf.
+Typical recipe: the **same** class list in both `auto_wrap_policy` and
+`activation_checkpointing_policy` — checkpoint every block that is also an FSDP unit (exactly our
+`fsdp_full_shard.yaml`).
+
+### Our A/B
+
+`fsdp_full_shard_act_ckpt.yaml` vs `fsdp_full_shard_no_act_ckpt.yaml` are identical at
+`batch_size: 12`, differing only by the presence of `activation_checkpointing_policy`. This isolates
+the activation-memory ↔ recompute-cost tradeoff at fixed batch — and, per the paper, it should not
+change the FSDP unit/comm behavior captured in `fsdp_units.json`.
 
 ---
 
-## Section 7: Mixed precision and `FSDPPrecision`
+## Section 9: Mixed precision: `FSDPPrecision` & NVFP4
 
-FSDP **requires** `FSDPPrecision`, not the generic AMP plugin.
-
-### Trainer precision → FSDP `MixedPrecision` mapping
-
-When you set `Trainer(precision="bf16-mixed")`, `FSDPPrecision` builds:
+FSDP **requires** `FSDPPrecision` (the generic AMP plugin is rejected). With
+`Trainer(precision="bf16-mixed")` Lightning builds:
 
 ```python
 torch.distributed.fsdp.MixedPrecision(
     param_dtype=torch.bfloat16,
-    reduce_dtype=torch.bfloat16,
+    reduce_dtype=torch.bfloat16,    # NOTE: grads reduce in bf16 by default, not fp32
     buffer_dtype=torch.bfloat16,
 )
 ```
 
-Supported `precision` strings:
-
-| Trainer `precision` | Param dtype | Autocast in forward | Grad scaler |
+| `precision` | param dtype | autocast fwd | grad scaler |
 |---|---|---|---|
-| `"32-true"` | fp32 | No | No |
-| `"16-true"` | fp16 | No (full fp16 compute) | No |
-| `"bf16-true"` | bf16 | No | No |
-| `"16-mixed"` | fp16 | Yes (fp16) | **ShardedGradScaler** (required) |
-| `"bf16-mixed"` | bf16 | Yes (bf16) | No |
+| `32-true` / `bf16-true` / `16-true` | fp32 / bf16 / fp16 | no | no |
+| `bf16-mixed` | bf16 | yes (bf16) | no |
+| `16-mixed` | fp16 | yes (fp16) | **ShardedGradScaler** |
 
-For `"16-mixed"`, FSDP uses `ShardedGradScaler` — the scaler state is sharded like gradients.
+If you want grads reduced in **fp32** (more numerically robust), pass a strategy-level
+`mixed_precision=MixedPrecision(..., reduce_dtype=torch.float32)` to override the plugin default.
 
-### What FSDPPrecision does beyond dtype
+### NVFP4 on FSDP
 
-- **`convert_module`** — for `"*-true"` modes, casts module weights to the target dtype before FSDP wrap.
-- **`forward_context`** — enables `torch.autocast("cuda", ...)` for `"*-mixed"` modes during forward.
-- **`convert_input` / `convert_output`** — cast batch tensors to the expected input dtype.
-- **`optimizer_step`** — integrates `ShardedGradScaler` for fp16-mixed.
+`FSDPNVFP4MixedPrecision` (`precision/nvfp4_mixed_precision.py`) is the FSDP sibling of
+`NVFP4MixedPrecision`. It is built on `FSDPPrecision`, nests TE's FP4 autocast inside the bf16
+autocast, and in `convert_module` swaps dim-eligible `nn.Linear` → `TeLinearAutocast` **before** the
+FSDP wrap, so the resulting `te.Linear` weights shard normally. It logs `nvfp4_convert_module.json`
+(which Linears were swapped/skipped).
 
-### Gradient clipping ⚠️
+> ⚠️ The NVFP4 plugins `import transformer_engine`. On a box without TE you'll get
+> `No module named 'transformer_engine'` at config-parse time — that's an environment gap, not a
+> config bug. Our `nvfp4_4b_wide_fused_glu.yaml` is the **non-FSDP** NVFP4 baseline and needs TE too.
 
-`FSDPPrecision.clip_grad_by_norm` **raises** — you cannot use Lightning's default `gradient_clip_algorithm="norm"` which calls `torch.nn.utils.clip_grad_norm_` on raw parameters.
+---
 
-**Correct approach:** call **`FSDP.clip_grad_norm_(max_norm)`** on the **root FSDP module**:
+## Section 10: Gradient clipping & optimizer under FSDP
+
+### Clipping must go through the FSDP root
+
+`torch.nn.utils.clip_grad_norm_` on raw params computes the wrong norm under sharding (and
+`FSDPPrecision.clip_grad_by_norm` raises). `SSMCoreLightningModule.configure_gradient_clipping`
+routes norm-based clipping to the FSDP root's collective-aware entry point:
 
 ```python
-# Pattern used in SSMCoreLightningModule.configure_gradient_clipping
-def configure_gradient_clipping(self, optimizer, gradient_clip_val, gradient_clip_algorithm):
-    if gradient_clip_algorithm == "norm":
-        self.trainer.strategy.model.clip_grad_norm_(gradient_clip_val)
+def configure_gradient_clipping(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
+    if gradient_clip_val is None or not isinstance(self.trainer.strategy, FSDPStrategy):
+        super().configure_gradient_clipping(...)            # non-FSDP / no clip
+        return
+    if GradClipAlgorithmType(gradient_clip_algorithm or "norm") == GradClipAlgorithmType.NORM:
+        self.trainer.strategy.model.clip_grad_norm_(gradient_clip_val)   # root FSDP module
     else:
-        # fall back to Lightning default for 'value' algorithm
-        ...
+        super().configure_gradient_clipping(...)            # value-based is shard-local
 ```
 
-Our `qwen3_4b_fsdp.yaml` sets `gradient_clip_val: 1.0` deliberately to exercise this FSDP-native path in smoke tests.
+`isinstance(strategy, FSDPStrategy)` is `True` for `AICFSDPStrategy` (subclass), so this fires for
+our runs. Our configs set `gradient_clip_val: 1.0`.
+
+### Optimizer
+
+Lightning forces **`use_orig_params=True`**, so the optimizer sees original `nn.Parameter` objects
+(not flat shards): write `configure_optimizers` normally against `self.parameters()`, and multiple
+param groups / `torch.compile` work. Optimizer states are sharded alongside params.
 
 ---
 
-## Section 8: Checkpointing: `state_dict_type`
+## Section 11: Checkpointing: `state_dict_type`
 
-FSDP checkpoints are fundamentally different from DDP because weights are **sharded**.
-
-### `"full"` (default in Lightning Trainer)
-
-- **Save:** all ranks participate; weights gathered to rank 0; **single `.ckpt` file** (standard Lightning checkpoint).
-- **Load:** broadcast + scatter from full state dict.
-- **Pros:** portable — one file, easy to share, load on different world sizes (with caveats).
-- **Cons:** rank 0 needs enough CPU RAM to hold the full model; slow for 100B+.
-
-### `"sharded"` (our YAML default for large runs)
-
-- **Save:** each rank writes its shard; checkpoint path is a **directory** with `N` shard files + metadata.
-- **Load:** distributed checkpoint load per rank.
-- **Pros:** scalable save/load; no rank-0 memory spike.
-- **Cons:** must resume with **same world size**; directory-based, harder to hand-copy.
-
-Lightning's `FSDPStrategy.save_checkpoint` / `load_checkpoint` implement both paths and **do not** use the generic `CheckpointIO` plugin — custom CheckpointIO is rejected.
-
-### Optimizer state
-
-Optimizer states are sharded alongside parameters. Lightning uses `FSDP.optim_state_dict` / `optim_state_dict_to_load` with the same `state_dict_type` context. Mismatch between saved optimizer count and current run raises `RuntimeError`.
-
----
-
-## Section 9: What Lightning does for you at runtime
-
-End-to-end lifecycle for `trainer.fit`:
-
-```mermaid
-sequenceDiagram
-    participant T as Trainer
-    participant S as FSDPStrategy
-    participant F as FullyShardedDataParallel
-    participant M as LightningModule
-
-    T->>S: setup_environment() — init process group
-    T->>S: setup(trainer)
-    S->>M: precision_plugin.convert_module(model)
-    S->>F: FullyShardedDataParallel(model, ...)
-    S->>F: apply_activation_checkpointing(...)
-    S->>S: setup_optimizers() — use_orig_params=True
-    loop training steps
-        T->>S: forward_context (autocast)
-        M->>F: forward — per-layer all-gather
-        M->>F: backward — reduce-scatter grads
-        S->>S: optimizer_step (ShardedGradScaler if fp16)
-    end
-```
-
-### Notable behaviors
-
-| Behavior | Detail |
-|---|---|
-| **`model_to_device` is a no-op** | FSDP handles device placement via `device_id` |
-| **`use_orig_params=True` default** | Optimizer sees original `nn.Parameter` objects, not flat shards — enables multiple param groups, `torch.compile`, and normal `configure_optimizers` |
-| **`restore_checkpoint_after_setup=True`** | Checkpoints load after FSDP wrap |
-| **`lightning_restore_optimizer=False`** | Optimizer restore handled inside FSDP load path |
-| **`tensor_init_context`** | Supports meta-device init; materialize happens bottom-up during FSDP wrap |
-| **`reduce()` for metrics** | Uses distributed mean/sum — important for callbacks that aggregate across ranks |
-| **`configure_sharded_model` override** | If implemented, Lightning **skips** auto FSDP wrap (legacy escape hatch) |
-
-### Diagnostic pattern (from `explore_gdn_fsdp.py`)
-
-At `on_fit_start`, inspect:
-
-```python
-strategy = trainer.strategy
-strategy.sharding_strategy
-strategy.cpu_offload
-strategy._state_dict_type
-strategy.kwargs.get("auto_wrap_policy")
-trainer.world_size
-sum(p.numel() for p in pl_module.parameters())  # local shard view
-```
-
-Compare local param count × world_size against expected global count to verify sharding.
-
----
-
-## Section 10: Knobs you actually tune in practice
-
-Ordered by how often you touch them in LLM training:
-
-| Priority | Knob | Typical starting value | What you're optimizing |
+| Type | Save | Load | Trade-off |
 |---|---|---|---|
-| 1 | `auto_wrap_policy` | `{TransformerBlock}` | Peak memory vs comms |
-| 2 | `sharding_strategy` | `FULL_SHARD` | Memory vs speed |
-| 3 | `activation_checkpointing_policy` | same as wrap policy | Activation memory |
-| 4 | `Trainer.precision` | `bf16-mixed` | Speed / stability |
-| 5 | `state_dict_type` | `sharded` at scale | Checkpoint I/O |
-| 6 | `cpu_offload` | `false` | Last-resort GPU memory |
-| 7 | `device_mesh` + `HYBRID_SHARD` | multi-node only | Cross-node bandwidth |
-| 8 | `**kwargs`: `backward_prefetch`, `forward_prefetch` | defaults | Pipeline comms with compute |
-| 9 | `**kwargs`: `limit_all_gathers` | `True` (default) | Memory vs overlap |
-| 10 | `**kwargs`: `sync_module_states` | `False` | Set `True` if ranks start from divergent init |
+| `full` | gather to rank 0 → single `.ckpt` | broadcast/scatter | portable; rank-0 RAM spike, slow at 100B+ |
+| `sharded` (our default) | each rank writes its shard → **directory** | distributed load per rank | scalable; must resume at **same world size** |
 
-### Our GDN + FSDP exploration knobs
-
-From `configs/qwen3_4b_fsdp.yaml` comments and `explore_gdn_fsdp.py` CLI:
-
-- **`--no-activation-checkpoint`** — pop policy for memory/speed isolation.
-- **`--no-compile`** — disable `torch.compile` to separate compile failures from FSDP failures (compile runs **before** FSDP wrap).
-- **`--devices N`** — override YAML device count.
-- **`gradient_clip_val`** — exercises FSDP-native clipping path.
+`FSDPStrategy.save_checkpoint`/`load_checkpoint` implement both and **do not** use the generic
+`CheckpointIO` (custom CheckpointIO is rejected). Optimizer state saves/loads via
+`FSDP.optim_state_dict` under the same `state_dict_type`.
 
 ---
 
-## Section 11: Gotchas and failure modes
+## Section 12: Gotchas
 
-### Optimizer must reference FSDP parameters
-
-With `use_orig_params=True` (default), write `configure_optimizers` normally against `self.parameters()`.
-
-With `use_orig_params=False`, you **must** create the optimizer **after** FSDP setup using `self.trainer.model.parameters()` — otherwise Lightning raises:
-
-> The optimizer does not seem to reference any FSDP parameters.
-
-### Do not use `torch.nn.utils.clip_grad_norm_`
-
-Use `strategy.model.clip_grad_norm_(max_norm)` or override `configure_gradient_clipping`. See §7.
-
-### Buffers and FSDP
-
-FSDP's handling of **buffers** (non-parameter tensors registered on modules) is subtle — they are generally **replicated**, not sharded. Our codebase explicitly avoids buffer usage in some layers:
-
-> We avoid using buffers because we've run into various issues doing so with FSDP.
-
-Prefer parameters or explicit state dict management for persistent non-trainable tensors.
-
-### `torch.compile` ordering
-
-Compile the **inner model before** `trainer.fit` lets Lightning wrap with FSDP — or compile after wrap depending on your PyTorch version and policy. Our explorer compiles `CoreModel` **before** Trainer instantiation so FSDP sees the compiled module tree. If compile + FSDP fails, `--no-compile` isolates the issue.
-
-### DataLoader workers + NCCL
-
-FSDP setup uses NCCL on the main process. Multiprocessing DataLoader workers during init can interact badly — our smoke script uses `num_workers=0`.
-
-### Checkpoint resume world size
-
-Sharded checkpoints require the **same** `world_size` as save. Full checkpoints are more flexible but still best-effort across topology changes.
-
-### Strategy registry default vs explicit YAML
-
-`strategy="fsdp"` alone does **not** set your custom `auto_wrap_policy` or `state_dict_type: sharded` — always use explicit `FSDPStrategy` config for production LLM runs.
-
-### Metric logging under sharding
-
-Callbacks that read **parameter tensors** see **local shards** only. For global norms (e.g. weight monitoring), you must `strategy.reduce()` across ranks — see `WeightMonitorCallback`, which all-reduces only when `isinstance(trainer.strategy, FSDPStrategy)`.
+- **Clipping:** never `torch.nn.utils.clip_grad_norm_`; use the root `clip_grad_norm_` (§10).
+- **Buffers under FSDP are fragile** — generally replicated, not sharded; we deliberately avoid
+  buffers in some layers (`ml_core/.../utils/v1/utils.py`: *"We avoid using buffers because we've
+  run into various issues doing so with FSDP."*). Prefer params or explicit state-dict management;
+  if a submodule must carry persistent buffers, `ignored_module_classes` keeps it intact (§7).
+- **`torch.compile` ordering:** `--compile` compiles the inner model **before** the FSDP wrap. If
+  compile + FSDP fails, drop `--compile` to isolate.
+- **Sharded checkpoint resume needs the same world size.**
+- **Metrics under sharding read local shards only.** For global norms, all-reduce — see
+  `WeightMonitorCallback`, which reduces only when `isinstance(trainer.strategy, FSDPStrategy)`.
+- **`strategy="fsdp"` shorthand** does *not* apply our wrap policy / `state_dict_type: sharded` /
+  `ignored_module_classes` — always use the explicit `AICFSDPStrategy` `class_path` block.
+- **Trainable + frozen params in one unit** can fail flat-parameter construction with
+  `use_orig_params=True` in some torch versions — group frozen modules into their own unit or ignore
+  them.
 
 ---
 
-## Appendix: PyTorch FSDP kwargs passed through `**kwargs`
+## Appendix: passthrough FSDP kwargs
 
-Anything not listed as a first-class `FSDPStrategy` argument is forwarded to `FullyShardedDataParallel(...)`.
-
-Common passthrough kwargs:
+Anything not a first-class `FSDPStrategy` arg is forwarded to `FullyShardedDataParallel(...)`.
 
 | Kwarg | Default | Effect |
 |---|---|---|
-| `use_orig_params` | **`True`** (Lightning sets) | Original param objects vs flat params |
-| `backward_prefetch` | `BACKWARD_PRE` | Prefetch next layer's params during backward |
-| `forward_prefetch` | `False` | Prefetch next layer's params during forward |
-| `limit_all_gathers` | `True` | Serialize all-gathers to reduce peak memory |
-| `sync_module_states` | `False` | Broadcast loaded weights from rank 0 on wrap |
-| `param_init_fn` | `None` | Custom meta → real materialization |
-| `ignored_modules` | `None` | Modules excluded from FSDP — params stay **full** on each rank, **not** sharded/reduced/cast. Needs instances, not classes. See §5. |
-| `ignored_states` | `None` | Newer unified form of `ignored_modules`; accepts params **or** modules. Only one of the two may be set. See §5. |
-| `process_group` | `None` | Custom process group (mutually exclusive with `device_mesh`) |
-| `device_mesh` | `None` | Device mesh for hybrid sharding |
+| `use_orig_params` | **`True`** (Lightning) | original param objects vs flat params |
+| `backward_prefetch` | `BACKWARD_PRE` | prefetch next unit's params in backward |
+| `forward_prefetch` | `False` | prefetch next unit's params in forward |
+| `limit_all_gathers` | `True` | serialize all-gathers to cap peak memory |
+| `sync_module_states` | `False` | broadcast rank-0 weights on wrap |
+| `ignored_modules` | `None` | set by `AICFSDPStrategy` from `ignored_module_classes` (§7) |
+| `ignored_states` | `None` | newer unified form (params **or** modules); only one of the two |
+| `device_mesh` / `process_group` | `None` | hybrid sharding / custom group (mutually exclusive) |
 
-Example — forward prefetch for throughput tuning:
-
-```python
-FSDPStrategy(
-    auto_wrap_policy={Block},
-    forward_prefetch=True,
-    backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-)
-```
-
-Consult the [PyTorch FSDP API docs](https://pytorch.org/docs/stable/fsdp.html) for the authoritative list — PyTorch adds kwargs over time.
+Authoritative list: [PyTorch FSDP API](https://pytorch.org/docs/stable/fsdp.html).
 
 ---
 
 ## Key takeaways
 
-1. **`FSDPStrategy` is orchestration** — it initializes distributed, wraps your module in `FullyShardedDataParallel`, wires `FSDPPrecision`, and handles sharded checkpoint I/O.
-2. **Three levers dominate LLM training:** `auto_wrap_policy` (granularity), `sharding_strategy` (what is sharded), `activation_checkpointing_policy` (activation memory).
-3. **Always pair FSDP with `FSDPPrecision`** via `Trainer(precision="bf16-mixed")` (or explicit plugin).
-4. **Gradient clipping and optimizer setup are FSDP-aware** — use `clip_grad_norm_` on the FSDP root module; rely on `use_orig_params=True` for normal optimizers.
-5. **YAML subclass config** (`class_path` + `init_args`) is the maintainable way to version-control FSDP settings alongside the rest of a training run.
+1. **We run `AICFSDPStrategy`**, a thin `FSDPStrategy` subclass adding YAML `ignored_module_classes`
+   and the `fsdp_units.json` audit — not stock `FSDPStrategy`.
+2. **Three levers dominate:** `auto_wrap_policy` (units/granularity), `sharding_strategy` (what's
+   sharded), `activation_checkpointing_policy` (activation memory).
+3. **Configs are layered:** `base_bf16_mixed.yaml` + a `fsdp_full_shard*.yaml` override; launch via
+   `experiment_v2.py` with stacked `--config_file`.
+4. **Activation checkpointing is orthogonal to FSDP** — the paper barely mentions it (only that
+   autograd hooks make it correct); the `act_ckpt` vs `no_act_ckpt` configs A/B it at fixed batch.
+5. **FSDP-aware clipping/optimizer** are handled in `SSMCoreLightningModule` + `use_orig_params=True`.
 
 ---
 
 ## Related reading
 
-- [PyTorch FSDP paper notes](../../pytorch-fsdp/) — ZeRO background, communication patterns, Meta's engineering tradeoffs
-- [NVFP4 + Lightning plugin guide](./nvfp4-impl-ideas.md) — composing custom precision plugins *on top of* FSDP once the baseline is stable
-- [PyTorch FSDP tutorial](https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html)
-- [Lightning FSDPStrategy API](https://lightning.ai/docs/pytorch/stable/api/lightning.pytorch.strategies.FSDPStrategy.html)
+- [PyTorch FSDP paper notes](../../pytorch-fsdp/) — ZeRO background, comm patterns, Meta's tradeoffs
+- [NVFP4 implementation ideas](./nvfp4-impl-ideas.md) — composing FP4 precision on top of FSDP
+- `src/aic_research/training/strategies/fsdp.py` · `tests/test_fsdp_report.py` · `configs/fsdp/`

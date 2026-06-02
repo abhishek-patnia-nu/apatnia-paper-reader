@@ -112,7 +112,24 @@ flowchart TB
 
 #### Why people still wrap contiguously in practice
 
-Although the wrap policy *allows* non-contiguous units, it's usually a bad idea. If a unit groups `layer0` and `layer3`, FSDP must keep that unit's unsharded FlatParameter **live from the moment `layer0` runs until `layer3` finishes** — spanning `layer1` and `layer2` in between. That widens the live window and inflates the $\max_i \psi_i$ term in the memory equation. Grouping *adjacent* layers (one unit per transformer block) keeps each unit's live window as short as possible, which is why that's the standard recipe.
+Although the wrap policy *allows* non-contiguous units, it's usually a bad idea. The reason: **a unit's FlatParameter can't be freed until *every* layer in that unit has finished its forward.** It's gathered once and held — not re-gathered per layer.
+
+Trace the exact Figure 1 grouping — unit0 = `{layer0, layer3}`, unit1 = `{layer1, layer2}`, unit2 = `{layer4, layer5}` — against the execution order `layer0 → layer1 → … → layer5`:
+
+| Step | Running | unit0 | unit1 | unit2 | Live (unsharded) |
+|---|---|---|---|---|---|
+| 1 | `layer0` | **gathered** | – | – | unit0 |
+| 2 | `layer1` | still held | **gathered** | – | unit0 **+** unit1 |
+| 3 | `layer2` | still held | held → freed after | – | unit0 **+** unit1 |
+| 4 | `layer3` | held → freed after | – | – | unit0 |
+| 5 | `layer4` | – | – | **gathered** | unit2 |
+| 6 | `layer5` | – | – | held → freed after | unit2 |
+
+During steps 2–3, **both unit0 and unit1 are unsharded simultaneously**, because unit0 owns `layer3` and so must stay resident across the `layer1`/`layer2` window waiting for it. Peak there is $\approx \psi_{\text{unit0}} + \psi_{\text{unit1}}$ rather than the $\max_i \psi_i$ the equation assumes.
+
+Contrast the contiguous wrapping (`{0,1}, {2,3}, {4,5}`): each unit's layers run back-to-back, so a unit is gathered → used → freed before the next is needed. Only **one** unit is live at a time and peak collapses to $\max_i \psi_i$. Grouping *adjacent* layers (one unit per transformer block) keeps each unit's live window as short as possible, which is why that's the standard recipe.
+
+> **Footnote:** Even with contiguous wrapping, FSDP *prefetches* the next unit's AllGather, and the rate limiter (§3.4) caps inflight AllGathers at 2 — so in practice ~2 units can be briefly resident (current + prefetched next). The $\max_i \psi_i$ in the equation is the idealized single-unit figure; both prefetch and non-contiguous wrapping push the real peak above it.
 
 ---
 

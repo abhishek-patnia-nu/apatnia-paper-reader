@@ -276,7 +276,7 @@ flowchart LR
         s2["GPU 2: chunk2"]
         s3["GPU 3: chunk3 + pad"]
     end
-    SH -->|"AllGather<br/>(before compute)"| FULL["Every GPU: FULL FlatParameter<br/>chunk0 ∣ chunk1 ∣ chunk2 ∣ chunk3"]
+    SH -->|"AllGather<br/>(before compute)"| FULL["Every GPU: FULL FlatParameter<br/>chunk0 chunk1 chunk2 chunk3"]
     FULL -->|"compute, then free"| SH
     FULL -.->|"backward → FULL gradient<br/>(same layout)"| GR["full gradient buffer"]
     GR -->|"ReduceScatter<br/>(sum + split)"| SH

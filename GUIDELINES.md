@@ -32,7 +32,11 @@ For each section:
 - **Paper figures:** Don't reproduce charts as ASCII or approximate Mermaid. Instead, reference the figure and ask the user to clip the image into `artifacts/`. Embed as `![Figure N](artifacts/figure_N.png)`.
 - **Explanatory diagrams:** Use Mermaid for *new* visuals (flowcharts, concept diagrams, architecture overviews, etc.)
 - Each paper folder has an `artifacts/` subfolder for clipped images from the PDF
-- Notes are designed to be read in **Obsidian** (Mermaid rendering, image embeds, wiki-links)
+- Notes are designed to be read in **GitHub-rendered markdown** (viewed on github.com / in-browser). Author for the GitHub renderer:
+  - **Links:** standard relative markdown links (`[text](section_2.md)`), not Obsidian `[[wiki-links]]`. Section anchors must match GitHub's slug rules (lowercase, punctuation dropped, spaces → hyphens).
+  - **Diagrams:** fenced ` ```mermaid ` blocks (GitHub renders these natively). Quote any node/edge label containing special characters. Subgraph `direction` is supported but layout may differ slightly from local renderers — don't rely on exact positioning.
+  - **Math:** `$$...$$` for display and `$...$` for inline (GitHub renders via MathJax). No spaces just inside inline `$` delimiters (`$F$`, not `$ F $`).
+  - **Images:** `![Figure N](artifacts/figure_N.png)` relative embeds render in the repo browser.
 - **Pacing:** One section per turn. Wait for the user before moving on. Never write ahead.
 
 ## Papers

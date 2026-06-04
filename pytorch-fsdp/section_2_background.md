@@ -12,6 +12,127 @@ Section 2 is short -- it sets up the design space for distributed training in Py
 
 Since you're solid on DDP and have the high-level parallelism picture from §1, this section mostly exists to expose the **two sharding sub-strategies** -- because the paper's choice of "communicate parameters" is a foundational design decision that everything else builds on. We'll spend most of our time there.
 
+But before any of that: a visual primer on the handful of GPU operations everything is built from. Nail these and the rest of the paper reads much more easily.
+
+---
+
+## Background you need: GPU collective operations (with pictures)
+
+Everything FSDP does to move parameters and gradients around is built from a small set of **collective communication operations** -- group operations in which *every* GPU participates together. §1 gave a quick text refresher; this is the visual version, because the rest of these notes lean on these ops constantly.
+
+Running example throughout: **4 GPUs**, each starting with one labelled piece of data. (The labels are stand-ins -- "A" could be a slice of a weight matrix, `g₀` a partial gradient, etc.)
+
+### AllGather -- "everyone ends up with everyone's piece"
+
+Each GPU contributes its own shard; afterwards every GPU holds the full concatenation of all shards.
+
+```mermaid
+flowchart TB
+    subgraph B1["BEFORE — each GPU holds only its own shard"]
+        direction LR
+        b0["GPU 0<br/>A"]
+        b1["GPU 1<br/>B"]
+        b2["GPU 2<br/>C"]
+        b3["GPU 3<br/>D"]
+    end
+    subgraph A1["AFTER — every GPU holds all shards"]
+        direction LR
+        a0["GPU 0<br/>A B C D"]
+        a1["GPU 1<br/>A B C D"]
+        a2["GPU 2<br/>A B C D"]
+        a3["GPU 3<br/>A B C D"]
+    end
+    B1 -->|"AllGather"| A1
+```
+
+**What it's for:** rebuild a *full* tensor (e.g. an unsharded weight matrix) out of the per-GPU shards. This is the operation that lets a GPU run a normal matmul even though it only permanently stores `1/N` of the weight.
+
+### ReduceScatter -- "sum across GPUs, but each keeps only one slice"
+
+Each GPU starts with a full-length vector of *partial* values (its own contribution to every slice). The op sums element-wise across all GPUs, then hands each GPU just **one** summed slice.
+
+```mermaid
+flowchart TB
+    subgraph B2["BEFORE — each GPU has partial values for ALL slices"]
+        direction LR
+        b0["GPU 0<br/>a₀ b₀ c₀ d₀"]
+        b1["GPU 1<br/>a₁ b₁ c₁ d₁"]
+        b2["GPU 2<br/>a₂ b₂ c₂ d₂"]
+        b3["GPU 3<br/>a₃ b₃ c₃ d₃"]
+    end
+    subgraph A2["AFTER — each GPU keeps ONE summed slice"]
+        direction LR
+        a0["GPU 0<br/>Σ aᵢ"]
+        a1["GPU 1<br/>Σ bᵢ"]
+        a2["GPU 2<br/>Σ cᵢ"]
+        a3["GPU 3<br/>Σ dᵢ"]
+    end
+    B2 -->|"ReduceScatter = sum + split"| A2
+```
+
+**What it's for:** reduce gradients across GPUs while leaving each GPU holding only the `1/N` slice it is responsible for. One op does both the sum and the split -- no separate scatter needed.
+
+### AllReduce -- "sum across GPUs, everyone gets the full result"
+
+Like ReduceScatter, except afterwards every GPU holds the *entire* summed vector, not just a slice.
+
+```mermaid
+flowchart TB
+    subgraph B3["BEFORE — each GPU has its own partial gradient"]
+        direction LR
+        b0["GPU 0<br/>g₀"]
+        b1["GPU 1<br/>g₁"]
+        b2["GPU 2<br/>g₂"]
+        b3["GPU 3<br/>g₃"]
+    end
+    subgraph A3["AFTER — every GPU has the full sum"]
+        direction LR
+        a0["GPU 0<br/>Σ gᵢ"]
+        a1["GPU 1<br/>Σ gᵢ"]
+        a2["GPU 2<br/>Σ gᵢ"]
+        a3["GPU 3<br/>Σ gᵢ"]
+    end
+    B3 -->|"AllReduce = sum, then share result"| A3
+```
+
+**What it's for:** classic data-parallel gradient averaging (DDP, §2.1 below), and the cross-replica sync step when the model is *replicated* across groups (§3.2.2).
+
+### The identity that ties them together
+
+AllReduce is exactly a **ReduceScatter followed by an AllGather**:
+
+```mermaid
+flowchart LR
+    A["each GPU:<br/>full partial vector"] -->|"ReduceScatter"| B["each GPU:<br/>1 summed slice"]
+    B -->|"AllGather"| C["each GPU:<br/>full summed vector<br/>= AllReduce result"]
+```
+
+This identity is why parameter-sharded training (§3.2) costs roughly **1.5× the communication** of plain data parallelism. DDP does one AllReduce per gradient (≈ 2× the data volume on the wire). Sharded training instead does an AllGather in forward, *another* AllGather in backward, plus a ReduceScatter -- ≈ 3× the volume.
+
+### The asymmetric cousins (Broadcast / Gather)
+
+Two one-sided ops show up occasionally:
+
+- **Broadcast** -- one GPU's data is copied to all GPUs.
+- **Gather** -- all GPUs' data is collected onto one GPU.
+
+The relevant gotcha: NCCL's *fast* AllGather requires every GPU's input to be the **same size**. When inputs are uneven, the library falls back to a slower Broadcast-based emulation. This is a big reason FSDP pads its shards to equal sizes (§3.2.1) -- to stay on the fast, even-size path.
+
+### Cost cheat-sheet (ring algorithm, N GPUs)
+
+| Op | Each GPU ends with | Bytes moved per GPU (≈) |
+|---|---|---|
+| AllGather | all N shards | (N−1) × shard size |
+| ReduceScatter | 1 summed slice | (N−1) × slice size |
+| AllReduce | full summed vector | 2 × (N−1)/N × vector size |
+
+Two practical facts fall out of these costs, and they drive a lot of FSDP's design:
+
+1. **Even input sizes are faster** (they stay on NCCL's optimized path) → motivates equal-size shards.
+2. **Fewer, larger collectives beat many small ones** (per-collective launch overhead dominates below ~33M elements) → motivates coalescing many small parameters into one big buffer.
+
+You'll meet each of these operations again -- with concrete parameter and gradient data flowing through them -- in the §3 diagrams.
+
 ---
 
 ## 2.1 Model Replication (DDP) -- a one-paragraph recap

@@ -42,6 +42,26 @@ In words: take a 6-layer model. Decompose into 3 "FSDP units" -- `[layer0, layer
    - ReduceScatter the gradients → each rank keeps its 1/N shard.
    - Free the AllGathered parameters.
 
+The two collectives from the [§2 primer](section_2_background.md#background-you-need-gpu-collective-operations-with-pictures) -- **AllGather** (rebuild full params) and **ReduceScatter** (sum + split grads) -- drive this entire loop:
+
+```mermaid
+flowchart TB
+    subgraph FWD["FORWARD — walk each unit in order"]
+        direction LR
+        f0["params sharded<br/>1/F per GPU"] -->|"AllGather"| f1["params FULL<br/>→ run forward"]
+        f1 -->|"free"| f2["params sharded"]
+    end
+    subgraph BWD["BACKWARD — walk each unit in reverse"]
+        direction LR
+        d0["params sharded"] -->|"AllGather"| d1["params FULL<br/>→ run backward<br/>→ FULL gradient"]
+        d1 -->|"ReduceScatter"| d2["gradient sharded<br/>1/F per GPU"]
+        d1 -->|"free params"| d3["params sharded"]
+    end
+    FWD -.->|"loss"| BWD
+```
+
+Notice the asymmetry: forward needs **one** collective per unit (AllGather), backward needs **two** (AllGather to rebuild params + ReduceScatter to reduce grads). Optimizer states never appear here -- they stay sharded the whole time (see the next subsection for why).
+
 $$
 \text{peak memory/rank} \;=\; \underbrace{\text{sharded model}}_{\text{always live}} \;+\; \underbrace{\text{largest single unit (unsharded)}}_{\text{live only during that unit's compute}}
 $$
@@ -245,6 +265,23 @@ Step 4 - chunk evenly into F pieces:
 >
 > ![Figure 3](artifacts/figure_3_full_sharding.png)
 
+At runtime, the two collectives from the [§2 primer](section_2_background.md#background-you-need-gpu-collective-operations-with-pictures) move this FlatParameter between its sharded and full forms. AllGather rebuilds the full buffer before compute; ReduceScatter pushes the gradient back down to shards. Because the chunks are equal-sized and laid out contiguously, both collectives hit NCCL's fast path with **zero extra copies**:
+
+```mermaid
+flowchart LR
+    subgraph SH["Steady state — FlatParameter sharded (1/F each)"]
+        direction TB
+        s0["GPU 0: chunk0"]
+        s1["GPU 1: chunk1"]
+        s2["GPU 2: chunk2"]
+        s3["GPU 3: chunk3 + pad"]
+    end
+    SH -->|"AllGather<br/>(before compute)"| FULL["Every GPU: FULL FlatParameter<br/>chunk0 ∣ chunk1 ∣ chunk2 ∣ chunk3"]
+    FULL -->|"compute, then free"| SH
+    FULL -.->|"backward → FULL gradient<br/>(same layout)"| GR["full gradient buffer"]
+    GR -->|"ReduceScatter<br/>(sum + split)"| SH
+```
+
 This **flatten-concat-pad-chunk** algorithm has several nice properties:
 
 | Property | Why it matters |
@@ -424,7 +461,25 @@ fast ReduceScatter within each host   (step 3)
 smaller AllReduce across hosts        (step 4, one shard at a time)
 ```
 
-Same correct result; most bytes move on NVLink.
+Same correct result; most bytes move on NVLink. Visually, the one global reduction becomes a fast within-host **ReduceScatter** plus a small cross-host **AllReduce** on matching shard indices:
+
+```mermaid
+flowchart TB
+    subgraph H0["Host 0 sharding group — NVLink (fast)"]
+        direction LR
+        a0["GPU 0..7<br/>full grads<br/>(own microbatch)"]
+    end
+    subgraph H1["Host 1 sharding group — NVLink (fast)"]
+        direction LR
+        a1["GPU 8..15<br/>full grads<br/>(own microbatch)"]
+    end
+    a0 -->|"ReduceScatter<br/>within host"| r0["Host 0: each GPU holds<br/>1/8 summed shard"]
+    a1 -->|"ReduceScatter<br/>within host"| r1["Host 1: each GPU holds<br/>1/8 summed shard"]
+    r0 -->|"AllReduce across hosts<br/>GPU k ↔ GPU k+8 (small)"| fin["Replicas synced<br/>each GPU: final 1/8 grad shard"]
+    r1 -->|"AllReduce across hosts<br/>(small)"| fin
+```
+
+The expensive AllGathers (forward + backward) are **not shown** here because in hybrid mode they never leave the host at all -- they run entirely inside each sharding group on NVLink. Only the post-backward gradient sync touches the slow cross-host link, and it carries just `1/F`-sized shards.
 
 #### Cross-host traffic (why hybrid wins on bandwidth)
 

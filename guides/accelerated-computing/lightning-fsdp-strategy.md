@@ -354,8 +354,89 @@ change the FSDP unit/comm behavior captured in `fsdp_units.json`.
 
 ## Section 9: Mixed precision: `FSDPPrecision` & NVFP4
 
-FSDP **requires** `FSDPPrecision` (the generic AMP plugin is rejected). With
-`Trainer(precision="bf16-mixed")` Lightning builds:
+**What this section covers.** What `torch.distributed.fsdp.MixedPrecision` actually does, and how
+`precision="bf16-mixed"` gives you the canonical recipe — **fp32 master weights** (optimizer steps
+and checkpoints in fp32) while **activations and GEMMs run in bf16**. Then how Lightning wires it,
+which knobs to turn, and the NVFP4 sibling plugin.
+
+> **Version note.** Grounded in **torch 2.9** + **Lightning 2.6.1**. The `MixedPrecision` dataclass
+> (six fields below) is byte-identical from torch 2.6 → 2.9, and Lightning's `FSDPPrecision` mapping
+> is unchanged, so everything here applies to 2.6 as well. (The top-of-file note still says torch
+> 2.6 — that's the only stale spot; reconcile when convenient.)
+
+### Background: `torch.autocast` (op-level mixed precision)
+
+`autocast` is **orthogonal to where a tensor is stored**. It's a context manager that, for the ops
+*inside* it, picks a compute dtype **per operation** based on a built-in safety policy — regardless
+of the dtype the parameters are stored in:
+
+```python
+with torch.autocast("cuda", dtype=torch.bfloat16):
+    y = layer(x)          # matmul/linear/conv  -> run in bf16  (fast, tolerant)
+    p = softmax(y)        # softmax/exp/sum/norm -> stay in fp32 (precision-sensitive)
+    loss = ce(p, target)  # loss reductions      -> stay in fp32
+```
+
+The policy (the "autocast op lists") splits ops into three buckets:
+
+| Bucket | Examples | Runs in |
+|---|---|---|
+| **Downcast-safe** (compute-bound, error-tolerant) | `linear`, `matmul`, `conv`, `bmm`, attention GEMMs | bf16 |
+| **Keep-fp32** (numerically sensitive) | `softmax`, `layer_norm`, `log`, `exp`, `sum`, losses | fp32 |
+| **Promote-to-widest** | ops mixing dtypes (e.g. `addcdiv`) | fp32 |
+
+Key mental model: autocast **inserts casts around ops**, it does **not** change the stored
+parameter dtype. A fp32 weight feeding a `linear` gets a transient bf16 view for that matmul; a bf16
+input feeding `layer_norm` gets upcast to fp32 for that op. So autocast alone already gives you "GEMMs
+in bf16, norms/softmax in fp32" **without touching your master weights**. (No `GradScaler` for bf16 —
+see below.)
+
+### Background: bf16 vs fp16 (quick refresher)
+
+Both are 16-bit, but spend their bits differently:
+
+| dtype | exponent bits | mantissa bits | dynamic range | precision | loss scaling? |
+|---|---|---|---|---|---|
+| fp32 | 8 | 23 | huge | high | n/a |
+| **bf16** | **8** | **7** | **same as fp32** | low | **No** |
+| fp16 | 5 | 10 | small (~6e-5 … 65504) | higher | **Yes (GradScaler)** |
+
+bf16 keeps fp32's exponent, so gradients rarely underflow/overflow → **no loss scaling needed**. fp16
+has a narrow range, so small gradients flush to zero unless you scale the loss up before backward and
+unscale before the step — that's what `ShardedGradScaler` does for `16-mixed`. This is why the
+`bf16-mixed` path has **no scaler** while `16-mixed` does.
+
+### What `MixedPrecision` does
+
+`MixedPrecision` is FSDP's **own** mixed-precision mechanism, separate from (and complementary to)
+autocast. It controls the dtype of the tensors FSDP physically materializes during its collectives.
+The full surface is six fields (torch 2.9):
+
+| Field | Default | What it controls |
+|---|---|---|
+| `param_dtype` | `None` | dtype of params **during forward/backward** — i.e. the dtype of the **all-gathered, unsharded** weight that feeds the GEMMs. Outside fwd/bwd the *sharded* params stay full precision. |
+| `reduce_dtype` | `None` | dtype of the **gradient reduction** (reduce-scatter). `None` → falls back to `param_dtype`. Set to `float32` to force fp32 grad reduction even with bf16 params. |
+| `buffer_dtype` | `None` | dtype buffers are cast to on the first forward (kept thereafter). FSDP does not shard buffers. |
+| `keep_low_precision_grads` | `False` | `False` → FSDP **upcasts grads to fp32 after backward** so the optimizer steps in fp32. `True` → keep grads in `reduce_dtype` (for low-precision optimizers). |
+| `cast_forward_inputs` | `False` | cast this module's forward args to `param_dtype`. |
+| `cast_root_forward_inputs` | `True` | the **root** FSDP module casts forward inputs to `param_dtype` (takes precedence over `cast_forward_inputs` at the root). |
+
+The line that answers your question is in the `param_dtype` docstring:
+
+> "This specifies the dtype for model parameters during forward and backward… Outside forward and
+> backward, the **sharded parameters are kept in full precision** (e.g. for the optimizer step), and
+> for model checkpointing, the parameters are **always saved in full precision**."
+
+So FSDP itself maintains the fp32/bf16 split: the **fp32 sharded shard is the master copy**; the
+bf16 unsharded copy is a transient produced by the all-gather, consumed by the GEMMs, then freed.
+
+### How `bf16-mixed` keeps master fp32 while GEMMs/activations run bf16
+
+This is the default recipe — you get it for free with `precision="bf16-mixed"`; **no extra config
+needed**. Two layers stack to produce it:
+
+**Layer A — FSDP `MixedPrecision` (the *weights*).** With `precision="bf16-mixed"`, `FSDPPrecision`
+builds:
 
 ```python
 torch.distributed.fsdp.MixedPrecision(
@@ -365,14 +446,89 @@ torch.distributed.fsdp.MixedPrecision(
 )
 ```
 
-| `precision` | param dtype | autocast fwd | grad scaler |
-|---|---|---|---|
-| `32-true` / `bf16-true` / `16-true` | fp32 / bf16 / fp16 | no | no |
-| `bf16-mixed` | bf16 | yes (bf16) | no |
-| `16-mixed` | fp16 | yes (fp16) | **ShardedGradScaler** |
+Crucially, the precision plugin's `convert_module` is a **no-op for `*-mixed`** (only the `*-true`
+modes do `module.to(dtype=...)`), so your `nn.Parameter`s are **created and kept in fp32**. FSDP then
+shards those fp32 params; the **sharded flat-param shard is fp32 = your master copy**. Before each
+unit's forward/backward, FSDP all-gathers and casts the unsharded copy to `param_dtype=bf16` → that
+bf16 weight is what the matmul sees. After backward, since `keep_low_precision_grads=False`, FSDP
+**upcasts the reduce-scattered grad shard back to fp32**, and the optimizer steps on the **fp32**
+master shard.
 
-If you want grads reduced in **fp32** (more numerically robust), pass a strategy-level
-`mixed_precision=MixedPrecision(..., reduce_dtype=torch.float32)` to override the plugin default.
+**Layer B — `torch.autocast` (the *ops*).** `FSDPPrecision.forward_context()` also enters
+`torch.autocast("cuda", dtype=torch.bfloat16)` for `*-mixed`. So even though the weights are already
+bf16, autocast governs the **op-level** policy: GEMMs/attention in bf16, softmax/layernorm/loss in
+fp32 (§autocast background). (Note `_desired_input_dtype` for `bf16-mixed` is **fp32**, so Lightning's
+`convert_input` casts the *batch* to fp32; autocast then downcasts inside the bf16-eligible ops.)
+
+```mermaid
+flowchart LR
+    M["fp32 sharded shard<br/>(MASTER — optimizer + checkpoint)"] -->|all-gather + cast to param_dtype| AG["bf16 unsharded weight"]
+    AG -->|matmul / attention| G["bf16 GEMMs & activations<br/>(under autocast: norms/softmax in fp32)"]
+    G -->|backward| GR["bf16 grads"]
+    GR -->|reduce-scatter in reduce_dtype| RS["bf16 grad shard"]
+    RS -->|"upcast (keep_low_precision_grads=False)"| F["fp32 grad shard"]
+    F -->|optimizer step| M
+```
+
+Net effect per step: **master weights, optimizer state, gradient-step, and checkpoints are fp32;
+all-gathered weights, activations, and GEMMs are bf16.** Exactly the recipe you asked about.
+
+| `precision` | stored param (master) | all-gathered param (compute) | autocast fwd | grad reduce | grad for optim step | grad scaler |
+|---|---|---|---|---|---|---|
+| `32-true` | fp32 | fp32 | no | fp32 | fp32 | no |
+| `bf16-true` | bf16 | bf16 | no | bf16 | bf16 | no |
+| `16-true` | fp16 | fp16 | no | fp16 | fp16 | no |
+| **`bf16-mixed`** | **fp32** | **bf16** | **yes (bf16)** | **bf16** | **fp32** (upcast) | no |
+| `16-mixed` | fp32 | fp16 | yes (fp16) | fp16 | fp32 (upcast) | **ShardedGradScaler** |
+
+> Note the contrast with `bf16-true`: there `convert_module` *does* cast the module to bf16, so the
+> **master shard is bf16** — no fp32 copy, no upcast. That's "pure" low precision, not mixed. The
+> warning `FSDPPrecision` emits for `*-true` ("FSDP will always retain a full-precision copy of the
+> model parameters for sharding") refers to the original-dtype shard — which for `*-true` *is* the
+> low-precision dtype.
+
+### Tuning knob: fp32 gradient reduction
+
+The one place the default `bf16-mixed` recipe is *not* fully fp32-safe is the **gradient reduction**:
+`reduce_dtype=bf16` means the cross-rank reduce-scatter accumulates in bf16, which can lose precision
+when summing many shards. To force fp32 reduction (more numerically robust, slightly more comm
+bytes), pass a **strategy-level** `mixed_precision` — it *replaces* the plugin-derived config
+outright (per `mixed_precision_config` precedence in §strategy), while autocast still comes from the
+plugin:
+
+```yaml
+trainer:
+  strategy:
+    class_path: aic_research.training.strategies.fsdp.AICFSDPStrategy
+    init_args:
+      mixed_precision:
+        class_path: torch.distributed.fsdp.MixedPrecision
+        init_args:
+          param_dtype: bfloat16
+          reduce_dtype: float32    # fp32 grad reduction; params/GEMMs still bf16
+          buffer_dtype: bfloat16
+```
+
+Because the override is **outright** (not a merge), you must restate `param_dtype`/`buffer_dtype` too.
+You keep `precision: bf16-mixed` on the `Trainer` so autocast + the fp32 master behavior are unchanged.
+
+> ⚠️ **dtype-from-YAML caveat.** `param_dtype`/`reduce_dtype`/`buffer_dtype` are `torch.dtype`
+> objects, not strings — jsonargparse won't necessarily coerce `bfloat16` → `torch.bfloat16` out of
+> the box. If the string form above fails to parse, the robust path is to build the `MixedPrecision`
+> in Python (e.g. in your strategy factory / a small config helper) and pass it to `AICFSDPStrategy`,
+> or register a dtype type-resolver. The Python equivalent is unambiguous:
+>
+> ```python
+> from torch.distributed.fsdp import MixedPrecision
+> import torch
+> AICFSDPStrategy(..., mixed_precision=MixedPrecision(
+>     param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16))
+> ```
+
+> **Norms stay fp32 anyway.** Per the `MixedPrecision` notes, layer/batch norm **accumulate in fp32**
+> regardless of `param_dtype`. The default `_module_classes_to_ignore=(_BatchNorm,)` additionally keeps
+> BatchNorm's *affine params* in fp32 (at the cost of separate collectives for those modules) when an
+> `auto_wrap_policy` is set. For genuinely fp32-everything submodules, use `ignored_module_classes` (§7).
 
 ### NVFP4 on FSDP
 

@@ -43,6 +43,7 @@ For each section:
 
 - [Pretraining Large Language Models with NVFP4](nvfp4-pretraining/) -- NVIDIA, 2025. FP4 training at scale.
 - [PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel](pytorch-fsdp/) -- Meta AI, 2023. ZeRO-style parameter sharding in PyTorch.
+- [DeepSeek-V4: Hybrid Attention (CSA + HCA)](deepseek-v4-attention/) -- DeepSeek-AI, 2026. Scoped to §2.3: compressed sparse attention for 1M-token context.
 
 ## Knowledge Profile
 

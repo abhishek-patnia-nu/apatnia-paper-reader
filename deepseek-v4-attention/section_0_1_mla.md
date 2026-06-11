@@ -2,204 +2,230 @@
 
 > **Lineage position:** This is the *root* of CSA's family tree. MLA (DeepSeek-V2, 2024)
 > introduced the idea that the KV cache should be a **compressed latent**, not raw keys
-> and values. CSA inherits MLA's query/KV down-projection wholesale — the `c^Q_t` latent
+> and values. CSA inherits MLA's query/KV down-projection wholesale — the $c^Q_t$ latent
 > in CSA eq. 13 is literally MLA's query compression. Read this first.
 
 ## What this section covers
 
-- **Background (you asked for detail here):** how the KV cache actually works and why it,
-  not the matmuls, is what makes long-context inference expensive.
-- **Quick refresher:** MQA/GQA — the first-generation fix.
-- **The main event:** MLA — compress K and V into one small latent vector per token,
-  cache only that, and reconstruct on the fly. Plus the RoPE complication MLA had to solve.
-- A worked memory-footprint example with real DeepSeek-V2 numbers.
+- **The KV cache** — why it exists, and why *it* (not compute) is the long-context
+  bottleneck. You asked for detail here.
+- **MQA/GQA** — one-paragraph refresher, just to place them in the lineage.
+- **MLA** — latent compression, the **weight-absorption** trick that makes it work, and
+  the decoupled-RoPE fix. Full depth.
+- A worked memory example with real DeepSeek-V2 numbers.
+
+## Notation
+
+All formulas in this folder use these symbols (values are DeepSeek-V2's, since that's
+where MLA shipped):
+
+| Symbol | Meaning | DeepSeek-V2 value |
+|---|---|---|
+| $d$ | model hidden dimension | 5120 |
+| $n_h$ | number of attention heads | 128 |
+| $d_h$ | dimension per head | 128 |
+| $d_c$ | MLA's KV latent dimension | 512 |
+| $d^R_h$ | decoupled-RoPE dimension per head | 64 |
+| $L$ | sequence length | — |
 
 ---
 
-## Background: the KV cache, in detail
+## Background: the KV cache is the bottleneck
 
-You're solid on multi-head attention, so the recap is one line: each head computes
-$\text{softmax}(QK^\top/\sqrt{d})V$, and for $n_h$ heads we project the input
-$h_t\in\mathbb{R}^{d}$ into per-head queries, keys, and values of dimension $d_h$ each.
+### Why a cache exists
 
-The part that matters for everything downstream is **what happens at inference time**,
-token by token (autoregressive decoding).
+When generating token $t$, its query attends to the keys and values of all tokens
+$1 \dots t$. Those keys/values never change once computed — token 5's key is the same
+whether the sequence is 6 tokens or 6000. So we compute each token's $k_t, v_t$ **once**,
+store them, and each decode step just appends one new pair and reads back the whole
+cache. That's the KV cache: it converts $O(t^2)$ recompute per step into $O(t)$ memory
+read.
 
-### Why a cache exists at all
+### Why it dominates
 
-When you generate token $t$, its query $q_t$ must attend to the keys and values of
-**all** previous tokens $1\dots t$. Those keys/values don't change when new tokens
-arrive — token 5's key is the same whether the sequence is 6 tokens long or 6000. So
-recomputing $K$ and $V$ for the whole prefix at every step would be pure waste.
+Count the scalars stored:
 
-The **KV cache** is the optimization: compute each token's $k$ and $v$ once, store them,
-and at step $t$ just append $k_t,v_t$ and read back the whole cache. This turns
-per-step attention from $O(t^2)$ recompute into $O(t)$ read.
+$$\text{cache size} = \underbrace{2}_{K\text{ and }V} \cdot n_{\text{layers}} \cdot \underbrace{n_h \cdot d_h}_{\text{per-token width}} \cdot L \cdot \text{batch}$$
 
-```mermaid
-flowchart LR
-    subgraph step_t["Decoding step t"]
-        q["q_t (this token only)"]
-        cache[("KV cache<br/>k_1..k_t, v_1..v_t")]
-        q --> attn["attention(q_t, K, V)"]
-        cache --> attn
-        attn --> out["output_t"]
-    end
-    knew["new k_t, v_t"] --> cache
-```
+Two facts make this the cost that matters:
 
-### The catch: the cache is enormous
+1. **It grows linearly with $L$.** At DeepSeek-V4's 1M-token target, the cache dwarfs the
+   model weights.
+2. **Decoding is memory-bandwidth-bound.** Generating one token does almost no
+   arithmetic, but must stream the *entire cache* through the GPU's memory bus. Cache
+   size directly sets tokens/sec and how many requests fit in a batch — halve the cache
+   and you roughly double throughput.
 
-The cache trades compute for **memory**, and at long context the memory bill is brutal.
-Size of the KV cache, in number of scalars:
+> **Worked number.** $n_{\text{layers}} = 60$, $n_h = 128$, $d_h = 128$, bf16 (2 bytes),
+> $L = 131072$ (128K), batch 1:
+> $2 \cdot 60 \cdot 128 \cdot 128 \cdot 131072 \cdot 2 \text{ bytes} \approx \mathbf{515\ GB}$ —
+> for *one* sequence. The whole field of efficient attention exists because of this number.
 
-$$\text{KV cache} = \underbrace{2}_{K\text{ and }V}\times\, n_{\text{layers}}\times n_h\times d_h\times \text{seq\_len}\times \text{batch}$$
-
-Two properties make this the dominant cost:
-
-1. **It grows linearly with sequence length.** At 1M tokens (DeepSeek-V4's target) the
-   cache dwarfs the model weights themselves.
-2. **Decoding is memory-bandwidth-bound, not compute-bound.** Generating one token does a
-   tiny amount of arithmetic but must *stream the entire KV cache through the GPU* to do
-   it. So the cache's size directly sets your tokens/sec and how many requests you can
-   batch. Halve the cache and you roughly double throughput.
-
-This is the lever every technique in this reading path pulls on. MQA/GQA, MLA, NSA, DSA,
-and finally CSA/HCA are all answers to one question: **how do we make the KV cache
-smaller (or cheaper to read) without hurting quality?**
-
-> **Worked number.** A 7B-ish model with $n_{\text{layers}}=60$, $n_h=128$, $d_h=128$, in
-> bf16 (2 bytes), at seq_len = 128K, batch = 1:
-> $2\times 60\times 128\times 128\times 131072\times 2\text{ bytes} \approx \mathbf{515\ GB}$.
-> That does not fit on one GPU. The whole field of efficient attention exists because of
-> this number.
-
----
-
-## Refresher: MQA and GQA (the first fix)
-
-You're familiar with these, so just the framing relative to the formula above.
-
-The expensive factor is $n_h$ (the cache stores a separate K and V *per head*). MQA and
-GQA attack exactly that factor:
-
-- **MQA (Multi-Query Attention):** all query heads share **one** K and one V head.
-  Replaces $n_h$ with $1$ → up to $n_h\times$ smaller cache. Cheap, but the aggressive
-  sharing can cost quality.
-- **GQA (Grouped-Query Attention):** a middle ground — $g$ groups of query heads, each
-  group sharing one KV head. Replaces $n_h$ with $g$ (e.g. 8). The standard choice in
-  Llama-2/3, Mistral, etc.
-
-Keep this mental model: **MQA/GQA shrink the cache by cutting the *head* dimension.** MLA,
-next, shrinks it along a *different* axis — and CSA later shrinks it along yet another
-(the *sequence* axis). That's the punchline of the whole lineage.
-
----
-
-## MLA: cache a latent, not the keys and values
-
-MLA's insight: instead of sharing K/V across heads, **store a single low-rank latent
-vector per token** and regenerate the per-head keys and values from it on demand. You pay
-a tiny extra matmul at read time to save a large amount of cache memory — exactly the
-right trade when you're memory-bound.
-
-### The compression
-
-For each token's hidden state $h_t\in\mathbb{R}^{d}$, MLA computes a **compressed KV
-latent** by a down-projection to a small dimension $d_c$ (e.g. 512, vs. a full
-$n_h d_h$ of 16384):
-
-$$c^{KV}_t = h_t W^{DKV},\qquad c^{KV}_t\in\mathbb{R}^{d_c}$$
-
-**This latent $c^{KV}_t$ is the only thing cached.** The per-head keys and values are
-reconstructed when needed via up-projections:
-
-$$k^{C}_t = c^{KV}_t W^{UK},\qquad v^{C}_t = c^{KV}_t W^{UV}$$
-
-Queries get the same low-rank treatment (this reduces activation memory during training,
-and — importantly for us — **this exact `c^Q` latent reappears in CSA**):
-
-$$c^{Q}_t = h_t W^{DQ},\qquad q^{C}_t = c^{Q}_t W^{UQ}$$
+Every technique in this reading path shrinks one factor of that product. This is the map
+for the entire folder:
 
 ```mermaid
 flowchart TB
-    h["h_t (hidden state)"] --> dkv["W_DKV (down-proj)"]
-    dkv --> c["c_KV_t  ∈ R^{d_c}<br/><b>← the only thing cached</b>"]
-    c --> uk["W_UK (up-proj)"]
-    c --> uv["W_UV (up-proj)"]
-    uk --> k["per-head keys k_t"]
-    uv --> v["per-head values v_t"]
-    style c fill:#a4d4a4,color:#000
+    formula["cache = 2 · layers · (heads · head-dim) · seq-len"]
+    formula --> ax1["shrink heads · head-dim<br/>by sharing across heads"]
+    formula --> ax2["shrink heads · head-dim<br/>by low-rank compression"]
+    formula --> ax3["shrink seq-len<br/>(fewer entries to read)"]
+    ax1 --> mqa["MQA / GQA"]
+    ax2 --> mla["MLA — this section"]
+    ax3 --> nsa["NSA, DSA → CSA / HCA<br/>(§0.2 onward)"]
+    style mla fill:#a4d4a4,color:#000
 ```
 
-### Why this is more than "GQA with extra steps"
+---
 
-The clever part is **weight absorption** at inference. Because $k^C_t = c^{KV}_t W^{UK}$,
-the query–key score is
+## Refresher: MQA and GQA
 
-$$q^{C\top}_t k^C_s = (c^Q_t W^{UQ})^\top (c^{KV}_s W^{UK}) = c^{Q\top}_t \big(W^{UQ\top}W^{UK}\big)\, c^{KV}_s.$$
+You're familiar with these, so only the framing matters. The cache stores a separate K
+and V **per head** — MQA/GQA attack the $n_h$ factor directly. **MQA:** all query heads
+share one K/V head ($n_h \to 1$, up to $128\times$ smaller, but quality suffers).
+**GQA:** $g$ groups of query heads each share one K/V head ($n_h \to g$, e.g. 8 — the
+Llama/Mistral standard). The trade is explicit: heads lose their *distinct* keys and
+values, so you buy memory with expressiveness. MLA's claim is that you don't have to
+make that trade.
 
-The bracketed term is a fixed matrix product you can **precompute once** and fold into the
-query projection. So you never actually materialize the full keys — you run attention
-*directly in the $d_c$-dim latent space*. Same trick absorbs $W^{UV}$ into the output
-projection $W^O$. The result: MLA gets MHA-level expressiveness (every head still has its
-own effective K/V) while caching only a GQA-or-better-sized latent.
+---
 
-### The RoPE complication (the one wrinkle to remember)
+## MLA: cache one latent per token
 
-There's a conflict. RoPE (covered in §2.3.3) rotates keys/queries by a
-**position-dependent** matrix $R_t$. That rotation sits *between* $W^{UQ}$ and $W^{UK}$ in
-the score, so it **can't be absorbed** — the nice precompute above breaks, because the
-matrix is now different for every $(t,s)$ pair.
+MLA's bet: the $n_h \cdot d_h = 16384$ scalars of per-token keys (and another 16384 of
+values) are highly redundant — they can be regenerated from a single **512-dim latent**.
+Store only the latent; reconstruct K and V on demand. A small extra matmul at read time
+for a $\sim 57\times$ smaller cache is exactly the right trade when you're
+bandwidth-bound, and the absorption trick below makes even that matmul disappear.
 
-MLA's fix is **decoupled RoPE**: split the representation into two parts.
+### The compression
 
-- A **compressed, NoPE part** that carries content and uses the absorption trick.
-- A small **decoupled RoPE part** ($q^R_t$, $k^R_t$, each $d^R_h$ dims, e.g. 64) that
-  carries *only* position. The key half $k^R_t$ is **shared across all heads** (like MQA)
-  and cached alongside the latent.
+Down-project each token's hidden state to the latent; that latent is **the only thing
+cached**:
 
-The two parts are concatenated before the softmax. So the MLA cache per token is:
+$$c^{KV}_t = h_t W^{DKV} \in \mathbb{R}^{d_c} \qquad (5120 \to 512)$$
 
-$$\underbrace{d_c}_{\text{content latent}} + \underbrace{d^R_h}_{\text{shared RoPE key}}\quad(\text{e.g. }512 + 64 = 576)$$
+Per-head keys and values are up-projected from it when needed — for head $i$:
 
-> Hold onto "decoupled / partial RoPE on a slice of dimensions" — DeepSeek-V4 keeps exactly
-> this idea and calls it *partial RoPE* (RoPE on the last 64 dims), in §2.3.3.
+$$k_{t,i} = c^{KV}_t W^{UK}_i, \qquad v_{t,i} = c^{KV}_t W^{UV}_i \qquad (512 \to 128)$$
+
+Queries get the same low-rank treatment (it saves activation memory in training, and —
+the reason we care — **this exact latent reappears in CSA eq. 13**):
+
+$$c^Q_t = h_t W^{DQ}, \qquad q_{t,i} = c^Q_t W^{UQ}_i$$
+
+### The key trick: weight absorption
+
+Reconstructing K per head sounds like extra work per decode step. The trick is that you
+never do it. Write out the attention score for head $i$ between query $t$ and a cached
+token $s$ (row-vector convention, scaling omitted):
+
+$$q_{t,i}\, k_{s,i}^\top = \big(c^Q_t W^{UQ}_i\big)\big(c^{KV}_s W^{UK}_i\big)^\top = c^Q_t \underbrace{\big(W^{UQ}_i W^{UK\top}_i\big)}_{\text{fixed: precompute once}} c^{KV\top}_s$$
+
+The bracketed product doesn't depend on $t$ or $s$, so fold it into the query path and
+define an **effective query** per head:
+
+$$\tilde q_{t,i} = c^Q_t \big(W^{UQ}_i W^{UK\top}_i\big) \in \mathbb{R}^{d_c} \qquad \Rightarrow \qquad \text{score} = \tilde q_{t,i}\, c^{KV\top}_s$$
+
+Attention now runs **directly against the cached latents** — keys are never
+materialized. The same absorption folds $W^{UV}$ into the output projection $W^O$, so
+values aren't materialized either.
+
+Here is the reframe worth remembering: **at inference, MLA *is* MQA with a 512-dim
+shared key — the latent itself.** Every head reads the same cached vector, like MQA. But
+unlike MQA, each head applies its *own* absorbed matrix $W^{UQ}_i W^{UK\top}_i$, so each
+head still attends with a genuinely different function. MQA's cache size, MHA's
+per-head expressiveness.
+
+### The RoPE wrinkle
+
+Absorption needs the two weight matrices to sit *adjacent* in the score so they can be
+premultiplied. RoPE breaks that: it inserts a position-dependent rotation $R_t$ after
+each projection, and the score becomes
+
+$$q_{t,i}\, k_{s,i}^\top = c^Q_t\, W^{UQ}_i\, \underbrace{R_t R_s^\top}_{=\,R_{t-s}} W^{UK\top}_i\, c^{KV\top}_s$$
+
+The rotation between the weights changes with relative position $t-s$, so there's no
+fixed matrix to precompute. MLA's fix is **decoupled RoPE**: split each head's score
+into two slices that are summed before the softmax —
+
+$$\text{score}(t, s, i) = \underbrace{\tilde q_{t,i}\, c^{KV\top}_s}_{\text{content slice: NoPE, absorbed, latent space}} + \underbrace{q^R_{t,i}\, k^{R\top}_s}_{\text{position slice: RoPE, tiny}}$$
+
+- The **content slice** is everything above — no positional encoding, absorption works.
+- The **position slice** is small ($d^R_h = 64$ dims): per-head RoPE queries $q^R_{t,i}$,
+  and a single RoPE key $k^R_t$ **shared by all heads** (MQA-style), cached alongside
+  the latent.
+
+So the full cache per token per layer is $d_c + d^R_h = 512 + 64 = 576$ scalars.
+
+> Hold onto "RoPE on a small slice of dims, NoPE on the rest" — DeepSeek-V4 keeps exactly
+> this idea under the name *partial RoPE* (§2.3.3).
+
+### The whole machine in one picture
+
+```mermaid
+flowchart LR
+    subgraph write["Write path — once per token t"]
+        h["h_t (5120)"] --> ckv["c_KV_t (512)<br/>via W_DKV"]
+        h --> kr["k_R_t (64)<br/>RoPE, shared by all heads"]
+    end
+    subgraph cache["KV cache: 576 scalars / token / layer"]
+        cyl1[("c_KV — content latent")]
+        cyl2[("k_R — position key")]
+    end
+    ckv --> cyl1
+    kr --> cyl2
+    subgraph read["Read path — every decode step, per head i"]
+        qt["effective query q̃_t,i (512)<br/>absorbed: W_UQ · W_UK already folded in"]
+        qr["RoPE query q_R_t,i (64)"]
+        score["scores = content + position<br/>softmax over s = 1..t"]
+        qt --> score
+        qr --> score
+        out["output — W_UV absorbed into W_O"]
+        score --> out
+    end
+    cyl1 --> score
+    cyl2 --> score
+```
+
+Keys and values exist only implicitly — nothing in the read path ever has shape
+$n_h \times d_h$ per cached token.
 
 ---
 
 ## Worked example: the memory win (DeepSeek-V2 numbers)
 
-DeepSeek-V2: $d=5120$, $n_h=128$, $d_h=128$, $d_c=512$, $d^R_h=64$, $n_{\text{layers}}=60$.
-
-**KV cache per token, per layer** (in scalars):
+KV cache per token, per layer, in scalars:
 
 | Scheme | Per-token-per-layer cache | Relative |
 |---|---|---|
-| MHA | $2\,n_h d_h = 2\cdot128\cdot128 = 32768$ | 1× |
-| GQA (8 groups) | $2\,g\,d_h = 2\cdot8\cdot128 = 2048$ | 16× smaller |
+| MHA | $2\, n_h d_h = 2 \cdot 128 \cdot 128 = 32768$ | 1× |
+| GQA (8 groups) | $2\, g\, d_h = 2 \cdot 8 \cdot 128 = 2048$ | 16× smaller |
 | **MLA** | $d_c + d^R_h = 512 + 64 = 576$ | **~57× smaller** |
 
-MLA beats even aggressive GQA, *and* (via absorption) keeps full per-head expressiveness
-rather than collapsing heads. That combination — small cache **and** strong quality — is
-why it became the DeepSeek house style and the foundation everything else builds on.
+MLA beats even aggressive GQA *and* keeps per-head expressiveness via absorption rather
+than collapsing heads. Small cache **and** strong quality is why it became the DeepSeek
+house style and the foundation everything in this folder builds on.
 
 ---
 
 ## Key takeaways
 
-- The KV cache grows linearly with context and **dominates long-context inference because
-  decoding is memory-bandwidth-bound** — streaming the cache *is* the bottleneck. Every
-  technique in this reading path shrinks or cheapens that cache.
-- **MQA/GQA** shrink the cache along the **head** axis (share K/V across heads).
-- **MLA** shrinks it along a **rank** axis: cache one low-rank latent $c^{KV}_t$ per token,
-  regenerate per-head K/V on read, and use **weight absorption** to run attention in latent
-  space with full per-head expressiveness.
-- RoPE can't be absorbed, so MLA uses **decoupled RoPE** on a small extra slice of dims —
-  the direct ancestor of DeepSeek-V4's *partial RoPE*.
-- The query latent $c^Q_t$ MLA introduced is **reused verbatim in CSA** (eq. 13), shared
-  between the sparse-selection indexer and the main attention.
-- Next axis to be exploited: the **sequence** axis. That's where NSA comes in.
+- The KV cache grows linearly with context, and decoding is **memory-bandwidth-bound**:
+  streaming the cache *is* the bottleneck, so cache size sets throughput.
+- **MQA/GQA** shrink the cache by sharing K/V across heads — trading expressiveness for
+  memory.
+- **MLA** caches one low-rank latent $c^{KV}_t$ per token. **Weight absorption** lets
+  attention run directly on the cached latents: at inference it behaves like MQA with the
+  latent as the shared key, but each head keeps its own absorbed projection — no
+  expressiveness trade.
+- RoPE can't be absorbed, so MLA splits each score into a NoPE content slice plus a tiny
+  **decoupled RoPE** slice ($+64$ dims, shared key) — the direct ancestor of
+  DeepSeek-V4's *partial RoPE*.
+- The query latent $c^Q_t$ is **reused verbatim in CSA** (eq. 13), shared between the
+  sparse-selection indexer and the main attention.
+- MQA/GQA cut the head axis; MLA cuts the rank axis. The remaining axis is **sequence
+  length** — that's NSA, next.
 
 ---
 

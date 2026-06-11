@@ -34,12 +34,38 @@ where MLA shipped):
 
 ### Why a cache exists
 
-When generating token $t$, its query attends to the keys and values of all tokens
-$1 \dots t$. Those keys/values never change once computed — token 5's key is the same
-whether the sequence is 6 tokens or 6000. So we compute each token's $k_t, v_t$ **once**,
-store them, and each decode step just appends one new pair and reads back the whole
-cache. That's the KV cache: it converts $O(t^2)$ recompute per step into $O(t)$ memory
-read.
+Start with what decoding costs **without** one. The model takes raw token IDs as input,
+so to produce token $t+1$ you must run a forward pass over the entire prefix
+$1 \dots t$. Inside every layer, that pass computes attention for *every* prefix token
+against *every* token before it — the full triangular $t \times t$ score matrix. You
+can't shortcut it to "just the last token, please": token $t$'s representation at layer
+$\ell$ needs the keys/values of tokens $1 \dots t-1$ *at layer $\ell$*, those need the
+same tokens' attention **outputs** at layer $\ell - 1$, and so on all the way down. So
+each decode step costs $O(t^2)$ — and almost all of it is **identical to what you
+computed the step before**. With causal masking, a past token never attends to anything
+new, so token 5's key, value, and attention output are bit-for-bit the same whether the
+sequence is 6 tokens long or 6000.
+
+The KV cache simply stops redoing that work. Compute each token's $k_t, v_t$ once, when
+it's generated, and store them. A decode step then computes q/k/v for **the one new
+token only**, appends $k_t, v_t$ to the cache, and computes a single new **row** of the
+attention matrix: $q_t$ against all $t$ cached keys. That's $O(t)$ per step — and the
+time it takes is dominated by *reading* the cache out of GPU memory, not by the
+arithmetic. (That fact is the centerpiece of the next subsection.)
+
+The accounting, per step and summed over generating a $T$-token sequence:
+
+| | step $t$ costs | whole generation |
+|---|---|---|
+| no cache | $O(t^2)$ | $O(T^3)$ |
+| KV cache | $O(t)$ | $O(T^2)$ |
+
+Note what the cache does **not** do: attention is still quadratic in total. Every pair
+of tokens still meets exactly once — each step contributes one new row, and over the
+full generation those rows stack into the same triangular $T \times T$ score matrix,
+computed exactly once instead of over and over. The cache eliminates
+*re*-computation, not computation. Shrinking the genuinely-quadratic part is a
+different problem — that's what the sparse-attention lineage (§0.2 onward) attacks.
 
 ### Why it dominates
 

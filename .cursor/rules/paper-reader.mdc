@@ -19,6 +19,13 @@ Follow GUIDELINES.md in the paper-reader root for full conventions. The non-nego
 - Check the Knowledge Profile in GUIDELINES.md -- skip concepts already mastered from prior papers.
 - Concepts marked "new" get deep background (worked examples, code, diagrams). "Familiar" gets a quick refresher. "Solid" is skipped.
 
+## Explanation Style
+
+- The reader understands **code best**: explain mechanisms with short PyTorch-style
+  snippets, a shape comment on every line (`# (t, d_h)`), one framing sentence per block.
+- Keep only equations that anchor to the paper's notation (cited eq numbers). No
+  prose-heavy walls, no dense formal math.
+
 ## Section Format
 
 1. "What this section covers" summary

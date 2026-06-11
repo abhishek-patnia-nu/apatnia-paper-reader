@@ -29,6 +29,13 @@ For each section:
 
 ### Conventions
 
+- **Explanation style (important — calibrated with the reader):** the reader understands
+  **code best**. Carry derivations and mechanisms in short PyTorch-style snippets with a
+  **shape comment on every line** (e.g. `# (t, d_h)`), one sentence of framing before each
+  block. Keep only the equations that anchor to the paper's notation (cited equation
+  numbers); avoid prose-heavy walls and avoid dense formal math (underbrace derivations,
+  set identities). Costs/complexity should be visible from the code structure (what's
+  inside vs. outside the loop) and the shape comments.
 - **Paper figures:** Don't reproduce charts as ASCII or approximate Mermaid. Instead, reference the figure and ask the user to clip the image into `artifacts/`. Embed as `![Figure N](artifacts/figure_N.png)`.
 - **Explanatory diagrams:** Use Mermaid for *new* visuals (flowcharts, concept diagrams, architecture overviews, etc.)
 - Each paper folder has an `artifacts/` subfolder for clipped images from the PDF

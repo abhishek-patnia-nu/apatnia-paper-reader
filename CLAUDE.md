@@ -49,6 +49,11 @@ These notes are authored for the **GitHub markdown renderer** (viewed in-browser
   the Knowledge Profile or marked "solid" in that paper's `paper_info.md` calibration table;
   give deep background (worked examples, code, diagrams) only to "new" concepts. Don't pad a
   section the reader already understands.
+- **Explain with code, not prose or heavy math.** The reader understands code best: carry
+  mechanisms in short PyTorch-style snippets with a **shape comment on every line**
+  (`# (t, d_h)`), one framing sentence per block. Keep only equations that anchor to the
+  paper's notation (cited eq numbers). See §0.1 of `deepseek-v4-attention` for the
+  reference example of this style.
 - **Links:** standard relative markdown — `[text](section_2.md)`, **not** Obsidian
   `[[wiki-links]]`. Section anchors follow GitHub slug rules (lowercase, punctuation dropped,
   spaces → hyphens). Keep the prev/next nav links at the bottom of each section correct.

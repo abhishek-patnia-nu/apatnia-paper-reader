@@ -35,48 +35,44 @@ where MLA shipped):
 ### Why a cache exists
 
 Decode step $t$ has to produce one thing — the newest token's attention output (per
-head; mask and output projection implicit):
+head; mask implicit):
 
-$$o_t = \mathrm{softmax}\!\left(\frac{q_t K_{1:t}^\top}{\sqrt{d_h}}\right) V_{1:t}, \qquad K_{1:t} = \begin{bmatrix} k_1 \\ \vdots \\ k_t \end{bmatrix},\quad V_{1:t} = \begin{bmatrix} v_1 \\ \vdots \\ v_t \end{bmatrix}$$
+$$\underbrace{o_t}_{1 \times d_h} = \mathrm{softmax}\!\Big(\underbrace{q_t}_{1 \times d_h}\; \underbrace{K_{1:t}^\top}_{d_h \times t} \big/ \sqrt{d_h}\Big)\; \underbrace{V_{1:t}}_{t \times d_h}$$
 
-If $K_{1:t}, V_{1:t}$ were just *available*, this is one row: $t$ dot products and a
-weighted sum — $O(t \cdot d_h)$.
+The shapes give the cost: $(1 \times d_h)(d_h \times t)$, then $(1 \times t)(t \times d_h)$
+— **one row**, $O(t \cdot d_h)$. Cheap, *if* the matrices $K_{1:t}$ and $V_{1:t}$ already
+exist.
 
-**Without a cache they aren't available** — the input is token IDs. Each key lives at a
-layer $\ell$, and its hidden state depends on the entire prefix below it:
+**Without a cache they don't** — the input is token IDs, so step $t$ re-runs the forward
+pass on the whole prefix, and each layer computes attention for all $t$ tokens at once:
 
-$$k^{(\ell)}_s = h^{(\ell)}_s W^K, \qquad h^{(\ell)}_s = f\big(h^{(\ell-1)}_1, \dots, h^{(\ell-1)}_s\big)$$
+$$\underbrace{Q}_{t \times d_h}\, \underbrace{K^\top}_{d_h \times t} \;\to\; \underbrace{S}_{t \times t}\,, \qquad \underbrace{\mathrm{softmax}(S)}_{t \times t}\, \underbrace{V}_{t \times d_h} \;\to\; \underbrace{O}_{t \times d_h}$$
 
-Unroll that dependency over layers and you are forced to compute attention for **every**
-prefix token, i.e. the full triangular score matrix
-$\mathrm{tril}\big(Q_{1:t} K_{1:t}^\top\big)$ with $\sim t^2/2$ entries:
+That $t \times t$ matrix is the $O(t^2)$ per step. You can't compute just the last row
+of it, because the keys you'd need at layer $\ell$ are built from hidden states that
+depend on the whole prefix one layer down:
 
-$$\text{cost of step } t \text{, no cache: } O(t^2)$$
+$$\underbrace{k^{(\ell)}_s}_{1 \times d_h} = \underbrace{h^{(\ell)}_s}_{1 \times d} W^K, \qquad h^{(\ell)}_s = f\big(h^{(\ell-1)}_1, \dots, h^{(\ell-1)}_s\big)$$
 
-**The identity that makes a cache valid** is causality. The dependency above runs only
-backwards, so for any $s \le t' < t$:
+**Causality is what makes a cache valid:** $h^{(\ell)}_s$ depends only on tokens
+$\le s$, so $k_s, v_s$ computed at step $s$ are *final* — the same numbers at every
+later step. Store them once. Step $t$ then computes only the new token's projections
+and appends one row to each cached matrix:
 
-$$h^{(\ell)}_s \text{ computed at step } t' \;=\; h^{(\ell)}_s \text{ computed at step } t \quad\Longrightarrow\quad k^{(\ell)}_s,\, v^{(\ell)}_s \text{ never change after step } s$$
+$$\underbrace{h_t}_{1 \times d} W^Q, \; h_t W^K, \; h_t W^V \;\to\; \underbrace{q_t, k_t, v_t}_{1 \times d_h \text{ each}}, \qquad K_{1:t} = \begin{bmatrix} K_{1:t-1} \\ k_t \end{bmatrix} \quad\text{(cache append)}$$
 
-Step $t$'s $O(t^2)$ of work is therefore step $t-1$'s work plus one new row — so compute
-each token's $k_s, v_s$ **once**, at step $s$, and store them. A decode step shrinks to:
-
-$$\underbrace{q_t,\, k_t,\, v_t \;=\; h_t W^Q,\; h_t W^K,\; h_t W^V}_{O(d^2),\ \text{new token only}} \qquad \underbrace{o_t = \mathrm{softmax}\!\big(q_t K_{1:t}^\top\big)\, V_{1:t}}_{O(t \cdot d_h),\ \text{one row}}$$
-
-— and the wall-clock of that row is dominated by *reading* $K_{1:t}, V_{1:t}$ out of GPU
-memory, not the arithmetic (next subsection).
+then runs the one-row attention from the top of this section: $O(t \cdot d_h)$ — whose
+wall-clock is dominated by *reading* $K_{1:t}, V_{1:t}$ out of GPU memory, not by the
+arithmetic (next subsection).
 
 **Totals** over generating a $T$-token sequence:
 
 $$\text{no cache: } \sum_{t=1}^{T} O(t^2) = O(T^3) \qquad\qquad \text{with cache: } \sum_{t=1}^{T} O(t) = O(T^2)$$
 
-The cache does **not** beat the quadratic — the per-step rows tile the triangular matrix
-exactly once:
-
-$$\bigcup_{t=1}^{T} \big\{\, q_t k_s^\top : s \le t \,\big\} \;=\; \text{all } \tfrac{T(T+1)}{2} \text{ causal pairs, each computed once}$$
-
-It eliminates *re*-computation, not computation. Shrinking the surviving $O(T^2)$ is the
-sparse-attention lineage's job (§0.2 onward).
+Still quadratic in total — each step contributes one new row of the triangular
+$T \times T$ score matrix, so every causal pair $(t, s)$ is computed exactly **once**
+instead of recomputed at every later step. The cache eliminates *re*-computation;
+shrinking the surviving $O(T^2)$ is the sparse-attention lineage's job (§0.2 onward).
 
 ### Why it dominates
 

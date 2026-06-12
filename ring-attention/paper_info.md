@@ -26,11 +26,22 @@ communication hides entirely behind computation, giving zero-overhead context sc
 context grows linearly with device count. Demonstrated up to 100M-token training contexts on
 TPU pods.
 
+## Calibration (questionnaire, 2026-06-12)
+
+| Concept | Level | Treatment in notes |
+|---------|-------|--------------------|
+| Online (incremental) softmax | new | deep background with worked code (§2) |
+| FlashAttention / tiled attention | new | deep background with worked code (§2) |
+| Activation memory accounting | familiar | light refresh, formulas only |
+| Collectives vs p2p/ring communication | familiar (solid on FSDP collectives) | explain p2p/ring, skip all-gather/reduce-scatter basics |
+| Compute/comm overlap, arithmetic intensity | new | full walkthrough of the block-size condition (§3) |
+| Prior sequence parallelism (Megatron SP, RSA) | new | background where the paper contrasts (§1, §6) |
+
 ## Paper Structure
 
 | Section | Topic | Status |
 |---------|-------|--------|
-| 1 | Introduction | |
+| 1 | Introduction | done |
 | 2 | Large Context Memory Constraint (activation memory math, BPT) | |
 | 3 | Ring Attention (the algorithm: ring rotation, arithmetic intensity, memory) | |
 | 4 | Setting (experimental setup) | |

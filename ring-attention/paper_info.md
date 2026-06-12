@@ -42,7 +42,7 @@ TPU pods.
 | Section | Topic | Status |
 |---------|-------|--------|
 | 1 | Introduction | done |
-| 2 | Large Context Memory Constraint (activation memory math, BPT) | |
+| 2 | Large Context Memory Constraint (activation memory math, BPT) | done |
 | 3 | Ring Attention (the algorithm: ring rotation, arithmetic intensity, memory) | |
 | 4 | Setting (experimental setup) | |
 | 5 | Results (max context, MFU, RL, LLM) | |

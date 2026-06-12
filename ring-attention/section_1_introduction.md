@@ -77,8 +77,7 @@ activation memory becomes independent of total sequence length $s$ (it depends o
 block size — Table 1 in §2/§3). Figure 1 of the paper shows this: Ring Attention trains
 512× longer sequences than the best single-device baseline on a TPUv4-1024 pod.
 
-> **Figure 1** — max context length vs. baselines on TPUv4-1024. *Clip into
-> `artifacts/figure_1.png` when reading the PDF.*
+![Figure 1 — max context length vs. baselines on TPUv4-1024](artifacts/figure_1.png)
 
 ## How this differs from what came before
 

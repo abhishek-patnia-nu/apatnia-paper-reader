@@ -13,7 +13,7 @@ The introduction sets up a clean story:
    - **DeltaNet** uses the *delta rule* to selectively replace old key-value bindings -- great for precise updates, but has no mechanism to clear stale memory in bulk.
 4. The paper introduces the **gated delta rule**, which combines both. Plus a hardware-efficient training algorithm and hybrid architectures.
 
-Since you marked linear attention, Mamba2, the delta rule, and online-learning interpretations as "new", we'll spend most of this section building the linear-attention foundation. The deeper math for Mamba2 and DeltaNet lives in Section 2.
+Per the calibration table in [paper_info.md](paper_info.md#knowledge-calibration), linear attention, Mamba2, the delta rule, and online-learning interpretations are "new", so we'll spend most of this section building the linear-attention foundation. The deeper math for Mamba2 and DeltaNet lives in Section 2.
 
 ---
 
@@ -23,16 +23,14 @@ Linear attention is the bedrock for everything else in this paper. It's a small 
 
 ### Quick refresher: what softmax attention computes
 
-You've got this solid, but let's nail the notation we'll reuse throughout. For a single query token at position `t`:
+You've got this solid, so just pin down the notation we'll reuse. For one query token at position `t`, softmax attention does:
 
-```
-softmax attention output at position t:
-
-         t
-o_t  =   Σ  α_{t,i} · v_i
-        i=1
-
-where  α_{t,i} = softmax over i of  (q_t · k_i) / √d_k
+```python
+K_past = K[:t]                             # (t, d_k)
+V_past = V[:t]                             # (t, d_v)
+scores = K_past @ q_t                      # (t,)
+weights = torch.softmax(scores / sqrt_dk, dim=0)  # (t,)
+o_t = weights @ V_past                     # (d_v,)
 ```
 
 So `o_t` is a weighted sum of value vectors `v_i` where the weights `α_{t,i}` come from a softmax over inner products. Softmax is what makes this nonlinear -- the weight on token `i` depends on *all* the other tokens through the normalization.
@@ -43,12 +41,11 @@ Cost: for every query `t` we touch every key/value pair, so total work is O(n²�
 
 What if we just removed the softmax (and the √d_k) and used the raw inner product as the "weight"?
 
-```
-linear attention output at position t:
-
-         t
-o_t  =   Σ  (q_t · k_i) · v_i              ← linear in q_t·k_i, not softmax-normalized
-        i=1
+```python
+K_past = K[:t]                             # (t, d_k)
+V_past = V[:t]                             # (t, d_v)
+weights = K_past @ q_t                     # (t,)
+o_t = weights @ V_past                     # (d_v,)
 ```
 
 This is what Katharopoulos et al. (2020) call linear attention. (In practice you replace `q_t · k_i` with `φ(q_t) · φ(k_i)` for some feature map `φ`, e.g. ELU+1, but the algebra below works for any φ -- we'll just write `q,k` to mean "after the feature map, if any".)
@@ -57,24 +54,22 @@ This is still a sum over all past tokens, so on its face it's still O(n²). But 
 
 ### The trick: reorder the sum into an outer-product accumulator
 
-The inner product `q_t · k_i` is a *scalar*. So `(q_t · k_i) · v_i` is a vector scaled by a scalar. Now:
+The inner product `q_t · k_i` is a *scalar*. So `(q_t · k_i) · v_i` is a vector scaled by a scalar. That lets us move the sum into a running matrix:
 
-```
-o_t  =  Σ_i  v_i · (k_i^T q_t)                 ← scalar = scalar, just rewriting
-     =  Σ_i  (v_i k_i^T) q_t                   ← v_i (k_i^T q_t) = (v_i k_i^T) q_t
-     =  ( Σ_i  v_i k_i^T ) q_t                 ← q_t doesn't depend on i, pull out
-     =  S_t · q_t                              ← define S_t := Σ_i v_i k_i^T
-
-where  S_t ∈ ℝ^{d_v × d_k}  is a matrix
+```python
+S_t = torch.zeros(d_v, d_k)                 # (d_v, d_k)
+for k_i, v_i in zip(K_past, V_past):        # k_i: (d_k,), v_i: (d_v,)
+    S_t = S_t + v_i[:, None] @ k_i[None, :] # (d_v, d_k)
+o_t = S_t @ q_t                             # (d_v,)
 ```
 
 The key step is `v_i (k_i^T q_t) = (v_i k_i^T) q_t`. Both are equal because the first is a scalar times a vector and the second is a `d_v×d_k` outer-product matrix times a `d_k` vector -- the resulting `d_v` vector is the same either way.
 
 That's the whole magic. We turned a sum-over-the-sequence into a matrix `S_t` that can be updated incrementally:
 
-```
-S_t  =  S_{t-1}  +  v_t k_t^T            ← rank-1 outer-product update
-o_t  =  S_t q_t                           ← read with q_t
+```python
+S_t = S_prev + v_t[:, None] @ k_t[None, :] # (d_v, d_k)
+o_t = S_t @ q_t                            # (d_v,)
 ```
 
 Each step is O(d²) regardless of `t`. Inference becomes O(n·d²) total -- linear in sequence length. And the model only ever needs to store the matrix `S` (size `d_v × d_k`), not the full key/value cache.
@@ -84,33 +79,15 @@ Each step is O(d²) regardless of `t`. Inference becomes O(n·d²) total -- line
 Let's actually compute this with `d_k = d_v = 2` so we can see every number:
 
 ```python
-import numpy as np
+K = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])       # (3, 2)
+V = torch.tensor([[10.0, 0.0], [0.0, 5.0], [1.0, 1.0]])      # (3, 2)
+q_t = torch.tensor([0.5, 0.5])                               # (2,)
 
-# 3 tokens, d_k = d_v = 2
-k = np.array([[1.0, 0.0],
-              [0.0, 1.0],
-              [1.0, 1.0]])          # 3 keys
-v = np.array([[10.0, 0.0],
-              [ 0.0, 5.0],
-              [ 1.0, 1.0]])         # 3 values
-q = np.array([0.5, 0.5])            # query at t=3
+weights = K @ q_t                                            # (3,)
+o_sum = weights @ V                                          # (2,) = [6.0, 3.5]
 
-# --- Method A: the sum form (slow but obvious) ---
-o_sum = sum((q @ k_i) * v_i for k_i, v_i in zip(k, v))
-# = (0.5)(10,0) + (0.5)(0,5) + (1.0)(1,1)
-# = (5,0) + (0,2.5) + (1,1)
-# = (6, 3.5)
-
-# --- Method B: the outer-product accumulator (fast) ---
-S = np.zeros((2, 2))                # state, d_v × d_k
-for k_i, v_i in zip(k, v):
-    S = S + np.outer(v_i, k_i)      # rank-1 update
-# After step 1: S = [[10,0],[0,0]]
-# After step 2: S = [[10,0],[0,5]]
-# After step 3: S = [[11,1],[1,6]]
-o_state = S @ q
-# = [[11,1],[1,6]] @ [0.5,0.5]
-# = (6, 3.5)                        ✓ same answer
+S = V.T @ K                                                  # (2, 2) = [[11, 1], [1, 6]]
+o_state = S @ q_t                                            # (2,) = [6.0, 3.5]
 ```
 
 Both methods give `(6, 3.5)`. Method B is the linear-RNN view: maintain a running matrix `S` and read it with the current query.
@@ -119,8 +96,10 @@ Both methods give `(6, 3.5)`. Method B is the linear-RNN view: maintain a runnin
 
 `S = Σ v_i k_i^T` is a sum of outer products. Each `v_i k_i^T` is a rank-1 matrix that, when right-multiplied by some vector `x`, produces:
 
-```
-(v_i k_i^T) x  =  v_i (k_i^T x)  =  v_i · ⟨k_i, x⟩
+```python
+binding_i = v_i[:, None] @ k_i[None, :]     # (d_v, d_k)
+score_i = k_i @ x                           # ()
+read_i = binding_i @ x                      # (d_v,) = v_i * score_i
 ```
 
 So this rank-1 matrix is a "soft lookup" that returns `v_i` scaled by how much `x` looks like `k_i`. Adding many such matrices builds up an **associative memory**: each pair `(k_i, v_i)` is a stored binding, and querying with `q` gives back `v_i` weighted by `⟨k_i, q⟩`.
@@ -142,11 +121,13 @@ flowchart LR
 
 At training time we want to compute *all* outputs `o_1...o_L` in parallel (not one at a time). Stacking the queries, keys, values into matrices `Q, K, V ∈ ℝ^{L×d}`, you get:
 
-```
-O = (Q K^T  ⊙  M) V                  ⊙ = elementwise multiply
+```python
+scores = Q @ K.T                            # (L, L)
+causal_scores = scores * causal_mask        # (L, L)
+O = causal_scores @ V                       # (L, d_v)
 ```
 
-where `M` is the `L×L` causal mask (`M_ij = 1` if `i ≥ j`, else `0`). This is the parallel form -- very matmul-heavy and GPU-friendly. The recurrent and parallel forms compute the same thing; you pick whichever is cheaper for your use case (training → parallel; inference → recurrent).
+where `causal_mask` is the `L×L` lower-triangular mask. This is the parallel form -- very matmul-heavy and GPU-friendly. The recurrent and parallel forms compute the same thing; you pick whichever is cheaper for your use case (training → parallel; inference → recurrent).
 
 > **Paper ref:** "the linear transformer can be formulated as the following linear recurrence... we can express it in both vector form (left) and matrix form (right)" (Section 2.1, page 2, Eq. unnumbered after Eq. 0)
 
@@ -165,20 +146,16 @@ Now to the *problem* with linear attention -- the one this whole paper is trying
 
 ### The capacity bound
 
-The state `S = Σ v_i k_i^T` has shape `d_v × d_k`. In rank/capacity terms, it can store at most `d_k` linearly-independent key-value bindings cleanly. Specifically, if you have `n` keys `k_1...k_n` that are pairwise orthogonal, you can recover each `v_i` exactly by querying with `k_i`:
+The state `S = Σ v_i k_i^T` has shape `d_v × d_k`. In rank/capacity terms, it can store at most `d_k` linearly-independent key-value bindings cleanly. If keys are orthogonal, only the matching value survives the read:
 
-```
-S k_j  =  Σ_i v_i (k_i^T k_j)  =  v_j · ‖k_j‖²    when keys are orthogonal
-                                                  (cross-terms zero)
+```python
+S = V.T @ K                                  # (d_v, d_k)
+read_j = S @ k_j                             # (d_v,)
+signal = v_j * (k_j @ k_j)                   # (d_v,)
+collisions = read_j - signal                 # (d_v,) = 0 when other keys are orthogonal
 ```
 
-But you can't have more than `d_k` mutually orthogonal vectors in `d_k`-dim space. Once `n > d_k`, some keys must overlap (`k_i^T k_j ≠ 0` for some `i ≠ j`), and querying gives a mix:
-
-```
-S k_j  =  v_j ‖k_j‖²  +  Σ_{i≠j} v_i (k_i^T k_j)
-                       ─────────────────────────
-                       interference terms ≠ 0
-```
+But you can't have more than `d_k` mutually orthogonal vectors in `d_k`-dim space. Once `n > d_k`, some keys must overlap (`k_i^T k_j ≠ 0` for some `i ≠ j`), and `collisions` becomes nonzero.
 
 This is what Schlag et al. (2021) and the paper call **memory collisions** -- different stored items start to interfere because the basis isn't big enough to keep them separate.
 
@@ -217,11 +194,11 @@ If your state is finite-capacity, you have to *manage* it -- decide what to keep
 
 Mamba2's update rule is a one-line modification of linear attention:
 
-```
-S_t  =  α_t · S_{t-1}  +  v_t k_t^T              0 < α_t < 1
-        ─────────────                            ↑
-        scale ALL old bindings                   data-dependent
-        by the same factor α_t                   from the input
+```python
+alpha_t = torch.sigmoid(W_alpha @ x_t)       # ()
+S_decayed = alpha_t * S_prev                 # (d_v, d_k)
+write = v_t[:, None] @ k_t[None, :]          # (d_v, d_k)
+S_t = S_decayed + write                      # (d_v, d_k)
 ```
 
 The key new idea: `α_t` is **data-dependent** -- it's a small scalar produced by a tiny network from the current input `x_t`. So the model can choose, at each step, how much of the past to keep. If `α_t = 0`, wipe everything. If `α_t = 1`, keep all (back to vanilla linear attention).
@@ -234,21 +211,18 @@ The key new idea: `α_t` is **data-dependent** -- it's a small scalar produced b
 
 DeltaNet uses a different update inspired by the Widrow-Hoff "delta rule" from 1960. Conceptually:
 
-```
-1. Read what's currently bound to key k_t :     v_old = S_{t-1} k_t
-2. Erase that binding:                          remove (v_old k_t^T) from S
-3. Write the new binding:                       add (v_t k_t^T) to S
+```python
+v_old = S_prev @ k_t                         # (d_v,)
+erase = beta_t * (v_old[:, None] @ k_t[None, :])  # (d_v, d_k)
+write = beta_t * (v_t[:, None] @ k_t[None, :])    # (d_v, d_k)
+S_t = S_prev - erase + write                 # (d_v, d_k)
 ```
 
 Algebraically this collapses to:
 
-```
-S_t  =  S_{t-1} (I − β_t k_t k_t^T)  +  β_t v_t k_t^T
-
-           ────────────────────       ──────────
-           erases the OLD binding     writes NEW
-           at key direction k_t        binding
-```
+$$
+S_t = S_{t-1}(I-\beta_t k_t k_t^\top) + \beta_t v_t k_t^\top
+$$
 
 `β_t` (also data-dependent) is the "writing strength" -- how aggressively to overwrite.
 
@@ -277,13 +251,22 @@ flowchart TB
 
 The whole motivation of the paper is: *why not have both knobs?* Set `α_t → 0` to clear, `α_t → 1` and use `β_t` to selectively edit. This is the **gated delta rule**:
 
-```
-S_t  =  S_{t-1} · α_t (I − β_t k_t k_t^T)  +  β_t v_t k_t^T          ← Eq. 10
-        ────────────────────────────────       ──────────
-        global decay × delta-rule erasure      delta-rule write
+$$
+S_t = S_{t-1}\big(\alpha_t(I-\beta_t k_t k_t^\top)\big) + \beta_t v_t k_t^\top
+\tag{10}
+$$
+
+In code, Eq. 10 is just "decay everything, erase the old value at this key, then write the new value":
+
+```python
+v_old = S_prev @ k_t                         # (d_v,)
+S_decayed = alpha_t * S_prev                 # (d_v, d_k)
+erase = alpha_t * beta_t * (v_old[:, None] @ k_t[None, :])  # (d_v, d_k)
+write = beta_t * (v_t[:, None] @ k_t[None, :])  # (d_v, d_k)
+S_t = S_decayed - erase + write              # (d_v, d_k)
 ```
 
-Section 3.1 will derive this and show it gracefully degrades to plain Mamba2 (when `β_t = 0`) or plain DeltaNet (when `α_t = 1`).
+Section 3.1 derives this and compares it directly to the two ancestors: `α_t` is the Mamba2-style global decay knob, and with `α_t = 1` the recurrence reduces to DeltaNet.
 
 > **Paper ref:** "we propose the gated delta rule, a simple and intuitive mechanism that combines both approaches. This unified rule enables flexible memory control: it can promptly clear memory by setting α_t → 0, while selectively updating specific content without affecting other information by setting α_t → 1" (page 2, paragraph 5)
 

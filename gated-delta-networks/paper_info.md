@@ -41,8 +41,8 @@ Linear Transformers are efficient alternatives to softmax attention but historic
 | App A | Extended WY representation proof | |
 | App B | Evaluation details and ablations | |
 
-## Figures to clip into `artifacts/`
+## Figure artifacts
 
-- `figure_1_architecture.png` — hybrid architecture and Gated DeltaNet block design
-- `figure_2_length_extrapolation.png` — length extrapolation on long benchmarks
-- `figure_3_training_throughput.png` — 1.3B model training throughput on a single H100
+- `figure_1_architecture.png` — clipped; embedded in [Section 1](section_1_introduction.md)
+- `figure_2_length_extrapolation.png` — todo: length extrapolation on long benchmarks
+- `figure_3_training_throughput.png` — todo: 1.3B model training throughput on a single H100

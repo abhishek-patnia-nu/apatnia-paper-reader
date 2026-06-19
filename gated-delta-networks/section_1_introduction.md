@@ -282,6 +282,12 @@ Four contributions, in order:
 | **Gated DeltaNet block + hybrid models** | Standalone GDN block (Llama-style) and two hybrids: H1 = GDN + sliding window attention; H2 = Mamba2 + GDN + SWA | 3.4 |
 | **Empirical evaluation** | 1.3B params, 100B tokens. Beats Mamba2 + DeltaNet on language modeling, common-sense reasoning, S-NIAH, real-world retrieval, length extrapolation, LongBench. | 4 |
 
+Figure 1 is technically from the architecture section, but it is useful as a preview here:
+Gated DeltaNet-H1 alternates Gated DeltaNet with sliding-window attention, while H2 adds
+Mamba2 into the pattern.
+
+![Figure 1](artifacts/figure_1_architecture.png)
+
 ### The headline numbers (from Section 4)
 
 ```

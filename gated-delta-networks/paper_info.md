@@ -27,9 +27,9 @@ Linear Transformers are efficient alternatives to softmax attention but historic
 | Section | Topic | Status |
 |---------|-------|--------|
 | 1 | Introduction | done |
-| 2 | Preliminary | |
-| 2.1 | Mamba2: Linear Attention with Decay | |
-| 2.2 | DeltaNet: Linear Attention with Delta Rule | |
+| 2 | Preliminary | done |
+| 2.1 | Mamba2: Linear Attention with Decay | done |
+| 2.2 | DeltaNet: Linear Attention with Delta Rule | done |
 | 3 | Gated Delta Networks | |
 | 3.1 | Formulation: the gated delta rule | |
 | 3.2 | Case study: Single Needle in a Haystack | |

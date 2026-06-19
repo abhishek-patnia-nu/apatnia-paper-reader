@@ -249,11 +249,10 @@ flowchart TB
     D1 --> G
 ```
 
-The whole motivation of the paper is: *why not have both knobs?* Set `α_t → 0` to clear, `α_t → 1` and use `β_t` to selectively edit. This is the **gated delta rule**:
+The whole motivation of the paper is: *why not have both knobs?* Set `α_t → 0` to clear, `α_t → 1` and use `β_t` to selectively edit. This is the **gated delta rule** in the paper's Eq. 10:
 
 $$
-S_t = S_{t-1}\big(\alpha_t(I-\beta_t k_t k_t^\top)\big) + \beta_t v_t k_t^\top
-\tag{10}
+S_t = S_{t-1}(\alpha_t(I-\beta_t k_t k_t^\top)) + \beta_t v_t k_t^\top
 $$
 
 In code, Eq. 10 is just "decay everything, erase the old value at this key, then write the new value":

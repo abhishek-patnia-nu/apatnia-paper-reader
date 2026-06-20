@@ -49,6 +49,11 @@ Now inference memory is constant in sequence length, but every fact has to share
 key-value binding into `S`. Once the sequence has more distinct bindings than the state
 can cleanly separate, reads start mixing values.
 
+The hand-wavy lookup intuition: `S @ k_j` asks the state, "what value is associated with
+this key?" If every stored key were perfectly separated, the only thing that would answer
+is `v_j` itself, scaled by how strongly `k_j` matches itself. That clean answer is
+`wanted`; everything extra is interference from other keys that partially resemble `k_j`.
+
 ```python
 S = V.T @ K                                # (d_v, d_k)
 read_j = S @ k_j                           # (d_v,)

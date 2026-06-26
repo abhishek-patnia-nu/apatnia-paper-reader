@@ -644,4 +644,6 @@ Authoritative list: [PyTorch FSDP API](https://pytorch.org/docs/stable/fsdp.html
 
 - [PyTorch FSDP paper notes](../../pytorch-fsdp/) — ZeRO background, comm patterns, Meta's tradeoffs
 - [NVFP4 implementation ideas](./nvfp4-impl-ideas.md) — composing FP4 precision on top of FSDP
+- [DDP vs FSDP1 vs FSDP2 precision](../parallel-strategies/precision.md) — framework-level precision behavior
+- [Declarative FSDP2 `apply_shard`](../parallel-strategies/declarative-apply-shard.md) — bottom-up FSDP2 wrapping and filters
 - `src/aic_research/training/strategies/fsdp.py` · `tests/test_fsdp_report.py` · `configs/fsdp/`

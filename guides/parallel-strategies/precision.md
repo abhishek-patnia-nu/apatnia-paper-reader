@@ -22,8 +22,9 @@ The guide is organized:
 
 - **§1-2** show what plain Lightning autocast does under DDP.
 - **§3-5** trace the extra FSDP1 bridge: `FSDPPrecision` -> `torch.distributed.fsdp.MixedPrecision`.
-- **§6** shows the FSDP2 split: autocast comes from Lightning, sharding dtype comes from you.
-- **§7-8** summarize the side-by-side behavior and the practical gotchas.
+- **§6** explains why FSDP2's `DTensor` representation changes precision control.
+- **§7** shows the FSDP2 split: autocast comes from Lightning, sharding dtype comes from you.
+- **§8-9** summarize the side-by-side behavior and the practical gotchas.
 
 ---
 
@@ -232,7 +233,7 @@ torch_fsdp_config = MixedPrecision(param_dtype=bf16, reduce_dtype=bf16, buffer_d
 ```
 
 (A `mixed_precision=` you pass at the **strategy** level in YAML *overrides* this. That is how you
-keep bf16 all-gather while forcing fp32 gradient reduction; see §3 and §8.)
+keep bf16 all-gather while forcing fp32 gradient reduction; see §3 and §9.)
 
 **Setup 3 — the strategy hands that config to torch FSDP1 and wraps the model:**
 
@@ -331,14 +332,65 @@ parameter all-gather + grad reduce-scatter into bf16.
 
 ---
 
-## 6. FSDP2: precision is *unbundled*
+## 6. Why DTensor changes the precision story
+
+Every precision difference above traces to one representational change:
+
+- **FSDP1** fuses a unit's parameters into one `FlatParameter`: one 1-D buffer, one dtype, one placement.
+- **FSDP2** keeps each parameter as its own `DTensor`: a tensor subclass carrying its local shard,
+  `DeviceMesh`, and placements.
+
+Flat-param means precision is controlled at the unit buffer. DTensor means precision can be controlled
+per parameter, as long as the strategy's `fully_shard` walk gives the right submodule its own policy.
+
+### 6.1 Per-parameter dtype: the RMSNorm example
+
+A flat buffer has one dtype. If an FSDP1 block uses `param_dtype=bf16`, every parameter in that flat
+buffer all-gathers as bf16. To keep one weight fp32, you have to carve it out with `ignored_states`.
+
+With FSDP2, each parameter is independent. A norm can be its own child unit with an fp32 policy, while
+the rest of the block uses bf16:
+
+```python
+fp32_policy = MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32)
+bf16_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+
+fully_shard(block.norm, mesh=mesh, mp_policy=fp32_policy)  # norm params stay fp32
+fully_shard(block, mesh=mesh, mp_policy=bf16_policy)       # remaining block params use bf16
+```
+
+This is separate from the norm's math. Many RMSNorm implementations already upcast activations inside
+the module. FSDP controls the norm **weight** dtype during all-gather; the module controls the activation
+math inside `forward`.
+
+### 6.2 Other DTensor wins
+
+- **Buffers keep their dtype.** FSDP2 removed `buffer_dtype`, so buffers such as RoPE caches stay in their
+  native dtype. FSDP1 `bf16-mixed` downcasts buffers to bf16 by default unless you override it.
+- **Unwrapped parameters keep native dtype.** Anything left for the root unit keeps its own master dtype;
+  no flat buffer imposes one shared dtype on unrelated parameters.
+- **N-D parallelism composes cleanly.** `DTensor` and `DeviceMesh` are the shared representation for data,
+  tensor, context, and pipeline parallelism. A `FlatParameter` cannot express a 2-D `(dp, tp)` or
+  `(dp, cp)` placement in the same way.
+- **Checkpoints use real parameter names.** Per-parameter `DTensor` state dicts avoid flat-param
+  flatten/rekey bookkeeping and can be resharded by Distributed Checkpoint.
+- **Per-parameter hooks and optimizers are natural.** `use_orig_params` is implicit, so hooks, selective
+  checkpointing, and `DTensor`-aware optimizer logic operate on real parameters.
+
+**Bottom line:** flat-param gives one dtype and placement per unit buffer. DTensor gives one dtype and
+placement per parameter. That is why FSDP2 can make fp32 carve-outs feel like normal policy choices
+instead of exception lists.
+
+---
+
+## 7. FSDP2: precision is *unbundled*
 
 FSDP2 (`fully_shard` + `DTensor`, driven by `ModelParallelStrategy`) has the **same two layers** — autocast
 and a sharding-dtype config — but **splits who owns them**. There is no `FSDPPrecision`: the flag drives
 *only* autocast, and the sharding dtypes come from a **FSDP2 policy** (`MixedPrecisionPolicy`) that *you*
 hand to `fully_shard`. Nothing derives it from `trainer.precision`.
 
-### 6.1 The flag no longer touches FSDP
+### 7.1 The flag no longer touches FSDP
 
 `ModelParallelStrategy` is a `ParallelStrategy`, **not** an `FSDPStrategy`, so the connector's FSDP branch
 is skipped — it never builds an `FSDPPrecision`:
@@ -361,7 +413,7 @@ if self._precision_flag in ("16-mixed", "bf16-mixed"):
 So `bf16-mixed` here gives the **AMP plugin** — the *same* autocast DDP uses — and **nothing else**. The
 flag has zero effect on how params are sharded or all-gathered.
 
-### 6.2 You own the sharding dtype via `MixedPrecisionPolicy`
+### 7.2 You own the sharding dtype via `MixedPrecisionPolicy`
 
 The FSDP2 analog of the **torch FSDP config** is the **FSDP2 policy**, passed per `fully_shard` call:
 
@@ -388,7 +440,7 @@ Differences from FSDP1's flat-param config:
   autocast's op-level fp32 allowlist (softmax/norm aren't auto-protected unless the module upcasts).
 - **No `buffer_dtype`** — buffers keep their dtype.
 
-### 6.3 Who calls `fully_shard`?
+### 7.3 Who calls `fully_shard`?
 
 Lightning's `ModelParallelStrategy` does **not** shard for you: you apply `fully_shard` yourself in
 `LightningModule.configure_model()` (or a strategy `setup()` override). That is the ownership split —
@@ -402,7 +454,7 @@ def configure_model(self):
     fully_shard(self.model, mesh=self.device_mesh["data_parallel"], mp_policy=mp)
 ```
 
-### 6.4 The traps this split creates
+### 7.4 The traps this split creates
 
 - **`bf16-mixed` alone (no `mp_policy`)** -> autocast runs, but `fully_shard` defaults to
   `param_dtype=None`, so the all-gather uses the parameter's original dtype, normally **fp32**. You get
@@ -416,7 +468,7 @@ def configure_model(self):
   `Precision.clip_grad_by_norm` can call `torch.nn.utils.clip_grad_norm_`, which is DTensor-aware in this
   stack. The FSDP1 "raise → use the root module's `clip_grad_norm_`" workaround (§5) is unnecessary.
 
-### 6.5 Recommended recipe (mirror the FSDP1 end-state)
+### 7.5 Recommended recipe (mirror the FSDP1 end-state)
 
 - `precision="bf16-mixed"` (AMP autocast for op-level fp32 safety) **+** `MixedPrecisionPolicy(param=bf16,
   reduce=fp32)` — closest to the FSDP1 arm; easiest A/B.
@@ -445,7 +497,7 @@ both on purpose, or the all-gather silently stays in the original parameter dtyp
 
 ---
 
-## 7. Side-by-side: `bf16-mixed`
+## 8. Side-by-side: `bf16-mixed`
 
 | Aspect | **DDP** (`MixedPrecision`) | **FSDP1** (`FSDPPrecision`) | **FSDP2** (`ModelParallelStrategy`) |
 |---|---|---|---|
@@ -463,7 +515,7 @@ both on purpose, or the all-gather silently stays in the original parameter dtyp
 
 ---
 
-## 8. Gotchas
+## 9. Gotchas
 
 - **FSDP1 `reduce_dtype`/`buffer_dtype` default to bf16** for `bf16-mixed`. Reducing grads in bf16 across
   many ranks can lose precision, and bf16 buffers can be a bad fit for some cached state. The fix is to
@@ -488,3 +540,6 @@ both on purpose, or the all-gather silently stays in the original parameter dtyp
 - `lightning/pytorch/strategies/fsdp.py` — `FSDPStrategy.mixed_precision_config` + FSDP wrap.
 - `lightning/pytorch/strategies/model_parallel.py` — `ModelParallelStrategy` (FSDP2 path; no `FSDPPrecision`).
 - `torch.distributed.fsdp` (PT 2.11) — `MixedPrecision`, `MixedPrecisionPolicy`, `fully_shard`, `FullyShardedDataParallel`, `ShardedGradScaler`.
+- PyTorch docs: `fully_shard`, `DTensor` / `DeviceMesh`, and Distributed Checkpoint.
+- torchtitan FSDP guide — FSDP1 flat-param vs FSDP2 `DTensor`.
+- [Declarative FSDP2 `apply_shard`](declarative-apply-shard.md) — how to attach FSDP2 policies and filters bottom-up.
